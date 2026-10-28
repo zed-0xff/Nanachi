@@ -9,7 +9,7 @@ Status (2026-10-23): works end-to-end on hardware. KlipperScreen is mirrored, to
 verified), Nanachi replaces the stock Sovol splash, ~8x lower latency and ~10x higher throughput than the
 per-rectangle first version. See `test-bench.md` for the hardware loop and the traps found on the way.
 
-Files (all under `ext/TFTTool/tools/` unless noted):
+Files (all under `tools/` unless noted):
 
 | file | role |
 |---|---|

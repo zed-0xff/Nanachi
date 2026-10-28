@@ -38,8 +38,8 @@ Docker: ks_docker (KlipperScreen + Xvfb 480x272, TCP 6099)  <-  Moonraker 192.16
 
 ## Deploy / test loop
 
-1. `python3 ext/TFTTool/tools/fastblit_fw/build.py` -> `TFWriter_AiHmiT7_fastblit.bin.make` in the repo root.
-2. `ext/TFTTool/tools/deploy.sh`: relay cycle, **framed** `twfile` of the image to `sd0/TFWriter_AiHmiT7.bin.make`
+1. `python3 tools/fastblit_fw/build.py` -> `TFWriter_AiHmiT7_fastblit.bin.make` in the repo root.
+2. `tools/deploy.sh`: relay cycle, **framed** `twfile` of the image to `sd0/TFWriter_AiHmiT7.bin.make`
    (`screen_probe.py upload ... --delete --repeat 1`, ~35 s at 10.7 KiB/s for ~387 KB), relay cycle, `reboot` detector.
 3. Confirm the new image is really what runs. `reboot` -> **no reply** = patched image (CPU reset);
    `invalid instruction` = stock. A deploy can silently go wrong: one upload ran at 14 KiB/s instead of 10.7 and the
