@@ -1,0 +1,7 @@
+*.pyc
+*.make
+*.rgb565
+
+__pycache__/
+.DS_Store
+kitchen/
