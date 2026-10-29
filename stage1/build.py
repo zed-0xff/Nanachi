@@ -5,7 +5,7 @@ Stage0 bootloader build.
 Real build pipeline (this replaces the old stub that copied a raw .bin straight
 into TFWriter_AiHmiT7.bin.make, which the stage 0 loader would not run):
 
-    minimal_stage1.S -- arm-none-eabi-gcc --> stage1_loader.elf
+    stage1.S -- arm-none-eabi-gcc --> stage1_loader.elf
                  -- arm-none-eabi-objcopy --> stage1_loader.bin
                  -- pad to >= 0x800, 4-byte aligned --> stage1_loader.padded.bin
                  -- fw_pack.pack()            --> TFWriter_AiHmiT7.bin.make
@@ -15,7 +15,7 @@ so `fw_unscramble.py` round-trips it and the loader accepts it. It runs at
 0x80000, where the loader puts the file (loader.c sub_20002F38: copy to RAM,
 VTOR=0x80000, MSP=*0, jump to the reset vector).
 
-`minimal_stage1.S` is pure assembly on purpose: a C entry cannot link here
+`stage1.S` is pure assembly on purpose: a C entry cannot link here
 because `-nodefaultlibs` drops newlib's `stdint.h`, so the working start code is
 hand-written ARM assembly (same reason `tools/sdboot.S` is asm).
 
@@ -34,7 +34,7 @@ sys.path.insert(0, TOOLS)
 import fw_pack  # noqa: E402
 import fw_unscramble  # noqa: E402
 
-SOURCE = os.path.join(HERE, "minimal_stage1.S")
+SOURCE = os.path.join(HERE, "stage1.S")
 LINKER = os.path.join(HERE, "linker.ld")
 ELF = os.path.join(HERE, "stage1_loader.elf")
 BIN = os.path.join(HERE, "stage1_loader.bin")
@@ -125,7 +125,7 @@ def main():
     ap.add_argument("-o", "--output", default=os.path.join(HERE, "..", "TFWriter_AiHmiT7.bin.make"),
                     help="output path (default: Nanachi/TFWriter_AiHmiT7.bin.make)")
     ap.add_argument("-s", "--source", default=SOURCE,
-                    help="assembly source to build (default: minimal_stage1.S)")
+                    help="assembly source to build (default: stage1.S)")
     args = ap.parse_args()
     build(args.output, args.source)
     return 0

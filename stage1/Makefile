@@ -7,7 +7,7 @@
 CC       = arm-none-eabi-gcc
 OBJCOPY  = arm-none-eabi-objcopy
 
-SOURCE   = minimal_stage1.S
+SOURCE   = stage1.S
 ELF      = stage1_loader.elf
 OUTPUT   = TFWriter_AiHmiT7.bin.make
 
