@@ -17,6 +17,10 @@ SECTIONS
         *(.text)
     }
 
+    /* fw_pack.pack() writes the container header (CRC32s, length) into image offsets 0x1C8..0x267, over whatever
+     * is there: code, vectors and literal pool must end before it. */
+    ASSERT(. <= 0x80000 + 0x1C8, "stage1 image overlaps the container header area 0x1C8..0x267")
+
     .rodata : {
         *(.rodata)
     }

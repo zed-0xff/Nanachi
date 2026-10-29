@@ -1,4 +1,5 @@
 *.bin
+*.elf
 *.img
 *.pyc
 *.make
