@@ -5,8 +5,8 @@
 A framework for TJC / Nextion-family touch-and-display panels (the AiHmiT7 line, e.g. the
 SoVol SV08MAX `TJC4827X243` 800×480). Two independent things ship here:
 
-1. **Stage 0 bootloader** — `stage0/`. A drop-in replacement for the panel's firmware that boots
-   from an SD card, validates the image, and can hand off to stock firmware. See `stage0/README.md`.
+1. **Stage 0 bootloader** — `stage1/`. A drop-in replacement for the panel's firmware that boots
+   from an SD card, validates the image, and can hand off to stock firmware. See `stage1/README.md`.
 2. **Screen tools** — `tools/`. Python utilities for the firmware container format, the TJC `.tft`
    checksum/instruction tables, and two host-side screen-mirroring approaches for KlipperScreen.
 
@@ -15,8 +15,8 @@ part of the framework.
 
 ## Layout
 
-- `stage0/` — bootloader source (loader.c, assembly trampolines, build scripts, docs)
-- `tools/` — publishable Python tools (see below)
+- `stage1/` — stage1 bootloader
+- `tools/` — Python tools (see below)
 - `kitchen/` — git-ignored scratch: KlipperScreen bridge, fast-blit firmware build, test images
 - `TFWriter_*.bin.make` — reference firmware images for the SD-card loader
 - `nanachi_raw.rgb565` — reference framebuffer blob
@@ -73,7 +73,7 @@ pip install pyserial pillow numpy
 
 `TFWriter_AiHmiT7.bin.make` (and the `fastblit`/`sdtest`/`poc_fill`/`stock` variants) are the
 container-format images the stage 0 loader reads from a FAT SD card. Regenerate with
-`python3 tools/fw_pack.py` (see `stage0/README.md`).
+`python3 tools/fw_pack.py` (see `stage1/README.md`).
 
 ## Docs
 
