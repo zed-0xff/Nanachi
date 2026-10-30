@@ -1,1 +1,0 @@
-../kitchen/sdboot_new.S
