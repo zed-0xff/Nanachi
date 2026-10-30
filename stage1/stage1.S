@@ -769,6 +769,8 @@ entry:
     bl uart_init                             @ mirror every diagnostic line below out over the TJC serial link too
     ldr r0, =uart_banner
     bl uart_puts
+    bl install_entry_hook                    @ see its own comment: lets us regain control after every future
+                                           @   ldr_exec (SD or flash), after decode, before the final jump
     pop {lr}
 
     @ ---- arm the hardware watchdog (~10s, see IWDG_RLR_VAL's comment) before doing anything else that could
@@ -2117,6 +2119,94 @@ wait_touch_i2c:
     blo .wti_hold
 
     pop {r4, r5, r6, r7, r8, r9, r10, r11, pc}
+
+/* ==========================================================================
+ *  Code-execution hook: regain control after ldr_exec's decode, before its final jump
+ * --------------------------------------------------------------------------
+ * ldr_main's ldr_exec(a1, a2, a3) (IDB 0x200015a4) copies the first 0x800 bytes a2->a1, sets
+ * VTOR = a1 & ~0x7F, then calls ldr_exec_(a1) (IDB 0x20001de0), which reads MSP=*a1 and the real
+ * entry = *(a1+4), stores that entry into a scratch global, and does an ABSOLUTE indirect call
+ * through it (`LDR R0,[addr]; BLX R0`) - not a PC-relative branch. a1 is 0 for the flash/stock
+ * path and stg1_start (0x80000) for our own SD-card pass; by this point a2 already holds the
+ * fully decoded/decrypted image (whatever "stock" means for this boot), copied in by ldr_main's
+ * earlier ldr_copy_and_check/ldr_load_map_ + Ldr::decode - this is the earliest point after that
+ * decode and before anything runs.
+ *
+ * We patch 24 bytes at LDR_CALL_PATCH_SITE (0x200015c4 - originally `BIC.W R0,R4,#0x7F` through
+ * `BL ldr_exec_`, confirmed via IDA disassembly, not guessed) to instead: save the real entry
+ * word, overwrite it with entry_trampoline's address, and still call ldr_exec_ exactly as before
+ * (so VTOR there onward is unset here - entry_trampoline sets it itself before continuing boot,
+ * since it has no byte budget there). Register R4 (=a1) is never touched by ldr_exec_'s own body
+ * before the final BLX, so entry_trampoline receives it for free.
+ *
+ * Using an absolute indirect call (the loader's own existing mechanism) instead of a direct
+ * branch is required, not a style choice: entry_trampoline lives in this image (~0x80000+) and
+ * the patch site is in the loader's SRAM (~0x20000000+) - about 31.5 MB apart, well beyond
+ * Thumb-2 BL/B.W's +/-16 MB range. A data patch (one pointer) crosses that distance for free; a
+ * code patch (another BL) could not reach from inside the loader even if we wanted one.
+ *
+ * The 24-byte blob below was verified byte-for-byte with the real toolchain (clang + arm-none-
+ * eabi-ld at this exact load address, see the session's own build log), confirming it lands
+ * exactly at sub_200015DC (0x200015dc, a real, still-called function right after the old VTOR
+ * literal) with zero overlap - not computed by hand. build.py patches the two movw/movt
+ * immediate halves (offsets 2..9) with entry_trampoline's real address after linking stage1
+ * once (same two-pass pattern as kitchen/fastblit_fw/build_fastblit.py's trampoline patching) -
+ * everything else in the blob is independent of where entry_trampoline ends up. */
+.equ LDR_CALL_PATCH_SITE, 0x200015c4
+.equ SCB_VTOR, 0xE000ED08
+
+install_entry_hook:
+    push {r4, lr}
+    ldr r4, =LDR_CALL_PATCH_SITE
+    ldr r0, =patch_blob
+    movs r1, #0
+.ieh_copy:
+    ldr r2, [r0, r1]
+    str r2, [r4, r1]
+    adds r1, r1, #4
+    cmp r1, #24
+    blo .ieh_copy
+    pop {r4, pc}
+
+.align 2
+/* Placeholder bytes for the loader patch - build.py overwrites this whole 24-byte block with the
+ * real, toolchain-assembled encoding (see install_entry_hook's comment) after the first link
+ * pass reveals entry_trampoline's address; the zeros here never ship. */
+patch_blob:
+    .space 24
+
+/* entry_trampoline: what the patched loader jumps into instead of the real stock/SD entry.
+ * R4 = a1 (0 for the flash/stock pass, stg1_start for our own SD pass) - untouched since the
+ * patch site, per the header comment above. The real entry address is stashed 4 bytes past this
+ * label's own address (entry_trampoline+4, written by the loader patch itself via `adds r0,r0,#4`
+ * off the same address this label resolves to) - kept as data, not code, so the first instruction
+ * here must jump over it. */
+.thumb_func
+entry_trampoline:
+    b.w .trampoline_body
+saved_entry:
+    .word 0
+.trampoline_body:
+    push {r4, lr}                            @ r4 (=a1) must survive whatever uart_* clobbers
+    bl uart_init
+    ldr r0, =hook_banner
+    bl uart_puts
+    @ TODO: interactive "receive and run arbitrary code over UART" loop belongs here - this is
+    @ just the hand-off point, not that feature yet.
+    pop {r4, lr}
+    @ continue booting: same VTOR/MSP setup ldr_exec itself would have done, computed from the
+    @ real a1 (r4) instead of the loader's own (now-bypassed) BIC.W/STR.
+    bic.w r2, r4, #0x7F
+    ldr r1, =SCB_VTOR
+    str r2, [r1]
+    ldr r0, [r4]                              @ MSP = *a1
+    msr msp, r0
+    ldr r0, =saved_entry
+    ldr r0, [r0]                              @ the real entry, saved by the loader patch before we overwrote it
+    bx r0
+
+.align 2
+hook_banner: .asciz "HOOK: entry_trampoline reached\r\n"
 
 .align 2
 /* 5x7 bitmap font, hand-drawn for this test (not a real font file): one byte per row, bits [4:0], bit 4 =
