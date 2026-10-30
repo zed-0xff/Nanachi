@@ -16,8 +16,22 @@ Built on the forensics in `flash_layout.md` / `fastblit.md` and on the sources o
 | peripherals | SPI `0x40003060` (SD card on SPI; the **loader carries its own FatFs**: "FAT32" string, long names, CP437), DMA2D `0x40024000` (display blit), UART (HMI serial, 4 KB buffer per wiki), touch controller, buzzer (PWM, the only audio), EEPROM 1 KB (wiki), **no RTC** (wiki: none), no Ethernet/WiFi, GPIO ≤ 8 (FPC variants may have no breakouts) | decompilation, wiki |
 | display | 480×272 RGB565; stock: double buffer in RAM + DMA2D blit (present = swap + `sub_1E9A8`); the panel interface itself (RGB LCD controller vs SPI) is not identified in the decompilation | `fastblit.md` |
 
-The SoC's **name is not published anywhere** (not in the wiki, not in the firmware strings): every driver
-exists only as decompiled stock code (`loader.c`, `app_10000.c`).
+**Update:** the SoC is no longer unidentified. It is a **Gree Edgeless GM6721-family chip (EAI80)**, dual
+Cortex-M4, and `ext/SoC/BPI-EAI80-bsp` is the vendor's own BSP for this exact chip family: `ulibs/hal/gree`
+gives full register-level C headers for every peripheral (GPIO, TIM, UART, DMA, CRC, crypto, SDRAM, SQI/SPI
+flash, ...) — most of the "register map from the decompilation" rows below are now cross-checked against
+this, not guessed from disassembly alone. It also bundles a **complete vendor fork of Zephyr RTOS**
+(renamed "ugelis", `ext/SoC/BPI-EAI80-bsp/ugelis`: Zephyr ~1.12, `boards/arm/bpi_eai80_qfn80pin` with a
+working `.dts`/`defconfig`/`pinmux.c`) plus its own prebuilt cross-toolchain
+(`ugelis/tools/ugelis-sdk`, `arm-zephyr-eabi-gcc` 9.2.0 — Linux x86-64 binaries, not runnable as-is on
+macOS). This does not drop straight onto the T7: the board file is for Gree/Banana Pi's own dev board (own
+pinmux, own boot flow), not for this screen, and it has not been built or booted here. But dts + drivers no
+longer need to be written from scratch for tier 1a below — they need adapting.
+
+One open question this resolves only partially: which exact variant this screen uses. The BSP supports two,
+`GM6721` and `F6721B` (register layout differs in a handful of places — see the HAL's `#ifdef CHIP_F6721B`).
+The vendor's own `bpi_eai80_qfn80pin` dev board builds with `CONFIG_SOC_F6721B` — a first concrete lean
+toward F6721B for this chip family, not proof for this specific screen PCB.
 
 ### Boot chain (and what we control of it)
 
@@ -128,27 +142,28 @@ Boot contract = the stock one (flat binary + container + loader jump).
 
 | driver | status |
 |---|---|
-| flash controller (MTD: read/erase/write + XIP window) | behaviour known (loader: RDID `0x90` + size table; stock app: A/B update + provisioning writes); register map from the decompilation |
+| flash controller (MTD: read/erase/write + XIP window) | behaviour known (loader: RDID `0x90` + size table; stock app: A/B update + provisioning writes); register map cross-checked against `ulibs/hal/gree/driver/sqi` |
 | SD on SPI (FatFs) | the loader carries a complete driver — extract it |
-| display (DMA2D blit) | stock path known (back/front buffers + `sub_1E9A8`); **the panel interface is not identified** (RGB LCD controller vs SPI) |
+| display (DMA2D blit) | stock path known (back/front buffers + `sub_1E9A8`); IMP (DMA2D-like blitter, `0x40024000`) register layout confirmed against the HAL and named in the IDB; **the panel interface itself is still not identified** (RGB LCD controller vs SPI) |
 | UART (console) | stock uses it (4 KB buffer) |
-| touch | controller exists (calibration "Touch Just", type `0x0002` in dataModel); register map to be found |
+| touch | **register-level flow known, not yet hardware-verified**: firmware picks resistive (4-wire ADC) or capacitive by `g_scr_info.field_16`; this unit reports capacitive type 2, GT911-style over a bit-banged I2C on `PB12`(SCL)/`PB13`(SDA), reset `PF6`, addr-select/INT `PF5`, status reg `0x814E`, 8-byte points from `0x814F` — see project memory `touch-hardware-i2c` |
 | clocks (200 MHz PLL) | the loader sets them before the jump — the OS inherits a running system |
-| buzzer PWM, GPIO, GPTimer | exist; registers to be found |
-| **SoC part name / datasheet** | **not found anywhere** — the single biggest bring-up cost |
+| buzzer PWM, GPIO, GPTimer | **buzzer confirmed on real hardware**: extended IO7 = `GPIOI` pin 3 = `TIM5_CH4` PWM (`stage1/stage1.S` beeps on boot without the stock firmware); GPIO bank layout and most TIM/CRC/IMP/TRNG registers are named in the IDB from the HAL |
+| **SoC part name / datasheet** | chip family identified (Gree Edgeless GM6721-family / EAI80, see the platform section above); no public datasheet, but the vendor BSP (`ext/SoC/BPI-EAI80-bsp`) supplies register-level headers for everything above |
 
 ### Tiered plan (rough effort)
 
 | tier | what | effort |
 |---|---|---|
 | 0 | own SD-boot C supervisor: shell over UART + FatFs (SD) + running flat/ELF binaries; 10–50 KB | **days** (SD-boot mechanism proven — `fastblit.md`) |
-| 1a | **Zephyr** board bring-up (dts + the drivers above) | **1–3 weeks** |
+| 1a | **Zephyr** board bring-up | **revised down, unverified**: the vendor's own fork ("ugelis") already has `dts`+drivers for this SoC family (`boards/arm/bpi_eai80_qfn80pin`) — the work is now adapting its board file to this screen's pinout and to our loader's boot contract (own linker script + entry, not a stock Zephyr boot), not writing drivers from scratch. Nobody has attempted building or booting it here yet, so treat this as optimistic until tried |
 | 1b | **NuttX** bring-up (busybox + elfffs on the NOR + SD) — the most "router-like" | **2–4 weeks** |
 | 2 | **mainline Linux** via the jserv recipe (bootwrapper role → our loader; drivers; MTD + fbdev + input) | **1–3 months** |
 | 3 | a BSD port | research project, not worth it |
 
-The risk concentrates in one place: reverse-engineering register maps (no datasheet) — mitigated by the fact
-that the stock code already implements every driver and is decompiled.
+The risk used to concentrate in one place, reverse-engineering register maps with no datasheet; that part is
+now much cheaper thanks to the vendor BSP (`ext/SoC/BPI-EAI80-bsp`). The remaining risk is board-specific
+adaptation (pinout, boot contract) and actually building/booting something, none of which has been tried yet.
 
 ### Synergy with DOOM
 
@@ -160,13 +175,18 @@ computer (shell + files + games) and the HMI becomes just one of its apps.
 
 ## Open questions
 
-- The SoC part name (not in the wiki, not in the firmware strings) — a datasheet would de-risk all drivers.
+- ~~The SoC part name~~ — resolved: Gree Edgeless GM6721-family (EAI80), vendor BSP at
+  `ext/SoC/BPI-EAI80-bsp`. Still open: GM6721 vs F6721B for *this* board specifically (see the platform
+  section).
 - The descriptor's `0x100` / `0x60000` fields (XIP window parameters?) — needs the ROM or a logic-analyzer
   boot capture (captures are in `4.txt` / `8.txt`).
 - The size / enable registers of the `0x20000000` RAM bank.
 - The panel interface (RGB LCD controller? its registers?).
-- The touch controller type (dataModel `0x0002`) and register map.
+- ~~The touch controller type and register map~~ — resolved at the protocol level (GT911-style I2C, see
+  the drivers table above and project memory `touch-hardware-i2c`); not yet verified against real hardware.
 - Whether the SoC has a USB device at all (the panel's "USB" may be a USB-UART bridge chip).
+- Whether `ugelis` (the BSP's bundled Zephyr fork) actually builds and boots on this screen's own board —
+  nobody has tried.
 
 ---
 
