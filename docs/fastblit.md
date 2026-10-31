@@ -9,23 +9,6 @@ Status (2026-10-23): works end-to-end on hardware. KlipperScreen is mirrored, to
 verified), Nanachi replaces the stock Sovol splash, ~8x lower latency and ~10x higher throughput than the
 per-rectangle first version. See `test-bench.md` for the hardware loop and the traps found on the way.
 
-Files (all under `tools/` unless noted):
-
-| file | role |
-|---|---|
-| `fastblit_fw/fast_blit_hook.c` | all injected C code (receiver, `blitrle`/`reboot`/`magenta`/`dumpbit` commands, `show_hmi_pic` hook) |
-| `fastblit_fw/{trampoline,reboot_trampoline,boot_trampoline,hmi_trampoline}.S` | hand-written Thumb trampolines (see "Hook sites") |
-| `fastblit_fw/build_patch.py`, `encoders.py` | lays out + patches the combined image (Thumb-2 BL/MOVW/MOVT encoders, validated against capstone) |
-| `fastblit_fw/build.py` | one-shot build: assemble, compile, patch, `fw_pack.py sdboot` -> `TFWriter_AiHmiT7_fastblit.bin.make` in the repo root |
-| `fastblit_fw/nanachi.rle` | embedded 480x272 Nanachi picture in the wire RLE format (~170 KB) |
-| `deploy.sh` | relay cycle -> framed `twfile` of the image to `sd0/` -> relay cycle -> `reboot` detector |
-| `screen_fastblit.py` | host: `FastLink`, `FastBridge`, `ReconnectingXSource`, latency test |
-| `bench_ks.py` | tap-to-picture benchmark against the KlipperScreen Xvfb |
-| `ks_docker/` | KlipperScreen in Docker (Xvfb 480x272 on TCP 6099) |
-
-`build_patch.py` reads `/Users/zed/projects/3d/sovol/screen/app_10000_plain.bin` (absolute path, stock plain firmware,
-must be 0x33C1C bytes) and the `.bin` trampolines in its own directory; run it through `build.py`.
-
 ## Wire protocol
 
 Two steps per batch, both over the normal ASCII/`twfile` serial channel (115200 default, 921600 supported):

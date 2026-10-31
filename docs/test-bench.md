@@ -12,35 +12,10 @@ Mac ──LAN──> camera pointed at the screen (MJPEG)                       
 Docker: ks_docker (KlipperScreen + Xvfb 480x272, TCP 6099)  <-  Moonraker 192.168.52.84:7125
 ```
 
-- **ESP32 bridge:** DTR must be on; it garbles the first bytes after open and after every host baud change
-  (`Screen` primes with an empty command, `_settle()` after baud changes). If it seems dead, send a bare `\r\n` to its
-  port: when it is *not* in UART passthrough mode it answers with its own prompt; silence = passthrough is active and
-  the screen (not the bridge) is what's silent. It can drop off USB; both ports disappearing at once
-  (2026-10-23, `/dev/tty.usb*` empty, `system_profiler` shows no USB devices) means the hub/cable/power dropped and
-  needs re-plugging. Do **not** open the screen port from a second process while a bridge/mirror runs
-  (`device reports readiness to read but returned no data (multiple access on port?)`; it also corrupts the mirror's
-  stream and causes multi-second batches).
-- **Relay (KMTronic):** 9600 baud, 3 raw bytes, no framing/checksum: ON `FF 01 01`, OFF `FF 01 00`. The usual 2-byte
-  `A0 01 01 A2` (LCUS) protocol and DTR/RTS toggling do nothing. A power cycle = OFF, wait 3 s, ON, wait ~10 s.
-  Sending ON while already ON is not a cycle. Typical use (`deploy.sh` does it):
-
-  ```python
-  r = serial.Serial('/dev/tty.usbserial-A60085Al', 9600, timeout=1)
-  r.write(bytes([0xFF,1,0])); r.flush(); time.sleep(3)
-  r.write(bytes([0xFF,1,1])); r.flush(); time.sleep(10)
-  ```
-- **Camera:** MJPEG at ~1 fps with ~2 s latency, crops the screen edges, so Nanachi/short flashes are easy to miss
-  and the extreme left/right of the screen is not visible. One frame:
-  `curl -s -m 3 -o f.jpg URL; python3 -c "d=open('f.jpg','rb').read();s=d.find(b'\xff\xd8');e=d.find(b'\xff\xd9',s);open('o.jpg','wb').write(d[s:e+2])"`
-  then view `o.jpg` (must be inside a readable working directory). For boot sequences, hold one connection open
-  and split frames on `FFD8..FFD9` in a thread while the relay cycles. `dumpbit` (see `fastblit.md`) is the readback
-  that survives the crop/blur: centered white squares per bit.
-
 ## Deploy / test loop
 
 1. `python3 tools/fastblit_fw/build.py` -> `TFWriter_AiHmiT7_fastblit.bin.make` in the repo root.
-2. `tools/deploy.sh`: relay cycle, **framed** `twfile` of the image to `sd0/TFWriter_AiHmiT7.bin.make`
-   (`screen_probe.py upload ... --delete --repeat 1`, ~35 s at 10.7 KiB/s for ~387 KB), relay cycle, `reboot` detector.
+2. Deploy.
 3. Confirm the new image is really what runs. `reboot` -> **no reply** = patched image (CPU reset);
    `invalid instruction` = stock. A deploy can silently go wrong: one upload ran at 14 KiB/s instead of 10.7 and the
    board behaved like an older build. Check behavior (e.g. a 2-frame upload acking `FD`) before debugging code.
