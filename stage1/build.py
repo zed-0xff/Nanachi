@@ -29,13 +29,10 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "..", "tools")
-FASTBLIT_FW = os.path.join(HERE, "..", "kitchen", "fastblit_fw")
 sys.path.insert(0, TOOLS)
-sys.path.insert(0, FASTBLIT_FW)
 
 import fw_pack  # noqa: E402
 import fw_unscramble  # noqa: E402
-from encoders import encode_movw, encode_movt  # noqa: E402
 
 SOURCE = os.path.join(HERE, "stage1.S")
 LINKER = os.path.join(HERE, "linker.ld")
@@ -43,13 +40,10 @@ ELF = os.path.join(HERE, "stage1_loader.elf")
 BIN = os.path.join(HERE, "stage1_loader.bin")
 LOAD_BASE = 0x80000
 
-# The 24-byte blob install_entry_hook copies to the loader's ldr_call tail (see stage1.S's own
-# header comment on install_entry_hook for the full story and how this was verified against the
-# real toolchain, not hand-encoded). Only bytes [2:10] (movw/movt r0, #entry_trampoline) depend on
-# where this build's entry_trampoline actually lands; everything else is a fixed instruction
-# sequence that doesn't reference any address local to this image.
-PATCH_BLOB_PREFIX = bytes.fromhex("6168")                            # ldr r1, [r4, #4]
-PATCH_BLOB_SUFFIX = bytes.fromhex("6060001d0160204601f0f0fe00bf")    # str/adds/str/mov/bl/nop
+# install_entry_hook's loader patch (see stage1.S's own header comment on it) is fully static now -
+# entry_trampoline's address is computed and written to TRAMP_LIT_SITE entirely at runtime, by
+# stage1's own normal `ldr r0, =entry_trampoline`, so no build-time byte-patching of a blob is
+# needed here at all anymore (unlike the old, now-abandoned 24-byte version of this patch).
 
 CCFLAGS = [
     "-mcpu=cortex-m4", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv4-sp-d16",
@@ -81,33 +75,6 @@ def to_binary():
     if res.returncode != 0:
         sys.exit(f"error: objcopy failed")
     print(f"binary   -> {os.path.basename(BIN)} ({os.path.getsize(BIN)} bytes)")
-
-
-def patch_entry_hook():
-    """install_entry_hook's patch_blob (see stage1.S) is assembled with placeholder (zero) bytes
-    for the movw/movt that materializes entry_trampoline's address, because that address isn't
-    known until this file is linked. Read it from the just-built ELF and splice in the real value -
-    same two-pass pattern kitchen/fastblit_fw/build_fastblit.py already uses for its trampolines."""
-    from elftools.elf.elffile import ELFFile
-
-    with open(ELF, "rb") as f:
-        elf = ELFFile(f)
-        syms = {s.name: s["st_value"] for s in elf.get_section_by_name(".symtab").iter_symbols() if s.name}
-    tramp_addr = syms["entry_trampoline"] | 1   # Thumb bit - this is stored as an "entry" value,
-                                                 # read back and BLX'd, same convention as pack()'s
-                                                 # own "word1 = entry+1" for every vector table.
-    blob_off = syms["patch_blob"] - LOAD_BASE
-
-    blob = PATCH_BLOB_PREFIX + encode_movw(0, tramp_addr & 0xFFFF) + encode_movt(0, (tramp_addr >> 16) & 0xFFFF) + PATCH_BLOB_SUFFIX
-    assert len(blob) == 24, f"patch blob must be 24 bytes, got {len(blob)}"
-
-    with open(BIN, "r+b") as f:
-        f.seek(blob_off)
-        existing = f.read(24)
-        assert existing == b"\x00" * 24, f"patch_blob at file offset 0x{blob_off:x} wasn't the expected placeholder zeros"
-        f.seek(blob_off)
-        f.write(blob)
-    print(f"hook     -> entry_trampoline @0x{tramp_addr - 1:x}, patch_blob patched at file offset 0x{blob_off:x}")
 
 
 def padded_bin():
@@ -144,7 +111,6 @@ def verify(packed):
 def build(output, source=SOURCE):
     compile_source(source)
     to_binary()
-    patch_entry_hook()
     data = padded_bin()
     packed = pack_image(data)
     with open(output, "wb") as f:
