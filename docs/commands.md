@@ -183,7 +183,7 @@ function `cmd_<name>`).
 | `wept` | add, lenth | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Streams incoming serial data into the user storage area (the write counterpart of `rept`); not tested. |
 | `rfpt` | var, address | 🔍 inferred | Likely reads the on-board SPI flash user area (flash-backed counterpart of `repo`). Tried with 3 operands (real count confirmed — 0/1/2/4 args all give `invalid parameter quantity`): any 3 unquoted operands (`sys0,0,4` in every order, incl. `0,0,0`) -> plain `invalid instruction`; any quoted-string operand -> `eeprom operation failed`->`invalid variable operation` — consistently, so none wants a quoted name. Argument meaning not found; screen stayed healthy. |
 | `wfpt` | var, address | 🔍 inferred; **no-op per the code** | **The dispatcher's opcode-4 slot (`tbb` @0x29ED0 in `cmd_grp2_storage`) jumps straight to the common return — there is no write code behind it** (which fits the silence below). Originally guessed to be: the flash-backed counterpart of `wepo`. Tried twice (`wfpt 0,0,0`, `wfpt sys0,0,4`): both gave **no reply at all** despite `bkcmd=3` (everything else replies); screen stayed responsive and `sys0` unchanged, but the silence is unexplained — **do not retry without accepting the risk**, since a silent write-type command could be waiting for raw bytes we didn't send. |
-| `rest` | — | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Resets (reboots) the device. No parameters. |
+| `rest` | — | ✅ tested on this screen | Resets (reboots) the device. No parameters. Confirmed a real reboot: a `dp` page-state marker set beforehand clears back to the default page (see the `dp` row), and the panel drops its UART for the whole boot. One stray `0x91` byte arrives during the blackout (unidentified). |
 | `getv` | — | 🔍 inferred from the firmware code, not tested | Likely gets a value with an explicit type/format conversion (complements `get`/`gets`). |
 | `draw` | x, y, x2, y2, color | ✅ tested on this screen | Draws a rectangle outline. |
 | `covx` | — | 🔍 inferred from the firmware code, not tested | Likely an extended variant of `cov` (type conversion) with more options. |
@@ -211,7 +211,7 @@ function `cmd_<name>`).
 | `delay` | Delay in milliseconds (a script-language statement, not a variable to read). |
 | `dim` | Current backlight brightness. |
 | `dims` | Default power-on backlight brightness. |
-| `dp` | Current page id. |
+| `dp` | Current page id. Gettable (numeric reply `0x71`). The power-on default page reads `0` (the stock splash is page 0x00, not 0x01); `page 1` → `dp` 1, `page 2` → 2. A clean reset marker: set it, `rest`, read it back. |
 | `pio0` | GPIO pin 0. |
 | `pio1` | GPIO pin 1. |
 | `pio2` | GPIO pin 2. |
@@ -269,7 +269,7 @@ function `cmd_<name>`).
 | `sfind0` | Returns a status value (`sub_19B88`); purpose not pinned down. |
 | `aacom` | Takes one character argument (`'1'` vs anything else) into `sub_19A80`; purpose not pinned down. |
 | `registered` | Returns the device’s registration/license status (`dataModel::sub_21214`); related to `getpassw` and the `HMISETPASSWORD15` provisioning command (see `sovol/flash_layout.md`). |
-| `systime` | Returns an internal time/uptime counter (`dword_761E6C`). |
+| `systime` | Returns an internal time/uptime counter (`dword_761E6C`). **Not gettable**: `get systime` → `0x1a` invalid variable name; not usable as a reset marker (`dp` is). |
 | `rprint` | Prints a variable’s value through whichever port `umport`/`printport` currently selects. |
 | `uwritef` | Writes N bytes (read via the flash-gated `freadr` path) out the selected port, one encoding. |
 | `uwriter` | Same as `uwritef` with a different (raw, not reformatted) encoding. |

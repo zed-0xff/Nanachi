@@ -16,9 +16,13 @@ Docker: ks_docker (KlipperScreen + Xvfb 480x272, TCP 6099)  <-  Moonraker 192.16
 
 1. `python3 tools/fastblit_fw/build.py` -> `TFWriter_AiHmiT7_fastblit.bin.make` in the repo root.
 2. Deploy.
-3. Confirm the new image is really what runs. `reboot` -> **no reply** = patched image (CPU reset);
-   `invalid instruction` = stock. A deploy can silently go wrong: one upload ran at 14 KiB/s instead of 10.7 and the
-   board behaved like an older build. Check behavior (e.g. a 2-frame upload acking `FD`) before debugging code.
+3. Confirm the new image is really what runs. `rest` -> **no reply** = patched image (CPU reset);
+   `invalid instruction` = stock. **Byte count alone is not a discriminator** — a dropped command looks identical
+   to a silent reset. To prove a reboot happened, use a state marker: set `page 2`, verify `get dp` = 2, send `rest`,
+   reconnect, `get dp` — back to 0 (default) = genuine reboot; still 2 = command dropped. For stage1 images a cold
+   pass also prints its banner, so banner-present = cold, silent = warm bail. A deploy can silently go wrong: one
+   upload ran at 14 KiB/s instead of 10.7 and the board behaved like an older build. Check behavior (e.g. a 2-frame
+   upload acking `FD`) before debugging code.
 4. Test through the mirror/bench and look at the camera.
 
 The loader keeps `TFWriter_AiHmiT7.bin.make` across boots (it is **not** consumed/renamed). The loader only needs a FAT

@@ -2,12 +2,16 @@
 
 Minimal ARM stage1 loader for the SoVol SV08MAX TFT screen (TJC4827X243_011C, AiHmiT7, Gree Edgeless GM6721-family
 dual Cortex-M4 @ 200 MHz, not an STM32). It runs from the SD card before the stock firmware: lights the panel's
-backlight, draws "HELLO WORLD" into a real framebuffer on top of a solid-colour fill by driving VOUT (the RGB/TTL
+backlight, draws identifier text into a real framebuffer on top of a solid-colour fill by driving VOUT (the RGB/TTL
 LCD timing controller) directly, plays a short "ta-daa" on the board buzzer (TIM5 PWM on GPIOI pin 3), then returns
-to the stage-0 loader, which goes on and boots the stock firmware as usual. All of it drives real SoC peripherals
-directly through their registers (SYS / GPIO / TIM5 / TIM8 / VOUT / PLLSAI) - no twfile, no UART interpreter
-traffic, no hooking into the stock app firmware's own code or addresses (deliberately: a from-scratch bring-up is
-not tied to one specific firmware build the way patching the stock binary in place would be).
+to the stage-0 loader, which goes on and boots the stock firmware. On a cold boot it also installs a 24-byte
+runtime hook into the loader itself (in SRAM, one boot's worth), so the loader's final jump to the stock firmware
+detours through an in-image trampoline that plays a second melody first. A warm reset (IWDG trip - SRAM survives)
+is detected by a flag and bails straight to the stock firmware, with none of the above. All of it drives real SoC
+peripherals directly through their registers (SYS / GPIO / TIM5 / TIM8 / VOUT / PLLSAI) - no twfile, no UART
+interpreter traffic, and the stock app firmware is never patched (the loader hook is the one deliberate exception:
+SRAM-only, cold-boot-only, and not tied to a specific firmware build the way patching the stock binary in place
+would be).
 
 Confirmed working on the real screen: the buzzer tune, the backlight, a solid colour fill of the whole panel via
 VOUT's background colour, a full framebuffer/layer (an actual addressable buffer in SDRAM, not just VOUT's flat
@@ -63,6 +67,37 @@ The image runs at 0x80000 (linked there, `linker.ld`), so the absolute addresses
 The file is the image wrapped in the loader's container format (an XOR key plus two CRCs; `tools/fw_pack.py`
 `pack()` / `tools/fw_unscramble.py`). The length must be >= 0x800, a multiple of 4 and < 0xC0000; `build.py` pads and
 verifies the CRCs.
+
+## Loader hook (2nd melody)
+
+On a cold boot, `entry` writes a 32-byte patch (two sites, both in the loader's SRAM copy -
+flash is never written) into the stage-0 loader's own code:
+
+- **site1** (24 B, `0x200015C4..0x15DB`, inside `ldr_call` @0x200015A4 - the span
+  `BIC.W R0,R4,#0x7F` … `BL ldr_exec_`): 7 NOPs kill the original VTOR write and the 4-byte
+  `BL.W`, then the tail (`mov r0, r4; mov/lsl/add r1, #0x20001DE1; blx r1`) re-runs
+  `ldr_exec_` (0x20001DE0). This tail is where a returning SD image falls in.
+- **site2** (8 B, `0x20001DF6..0x1DFD`, inside `ldr_exec_`): replaces
+  `LDR R0,=ldr_last_dst; LDR R0,[R0]; BLX R0` with `mov r0, #hi(TRAMP); lsl r0, #12; add r0, #lo(TRAMP); blx r0`
+  - all 16-bit, because the window has no room for 32-bit instructions. This redirects **every**
+  `ldr_exec_` jump (original and re-run) into the in-image `entry_trampoline`.
+
+`entry_trampoline` reads `ldr_exec_`'s fresh stack frame (a1, target = `[a1+4]`), and since
+site1 killed the VTOR write, restores it (`a1 & ~0x7F`). `a1 != 0` (SD pass): silent - it jumps
+to `entry`, which bails on `BOOT_FLAG`, and the trampoline epilogue unwinds the loader frames
+back to `ldr_main`. `a1 == 0` (the stock pass - the final hand-off of the boot): it plays the
+`melody2` chime **only when** the `HOOK_DONE` flag (0x2000FFF8) is set - `entry` sets it at the
+end of the cold path, and the trampoline consumes it there (at most one chime per power-on) -
+then jumps to the stock reset vector (one-way). The jump stays the loader's own
+absolute-indirect BLX mechanism: the image at 0x80000+ and the loader at 0x20000000+ are ~31.5 MB
+apart, far outside BL range; only a pointer crosses that.
+
+`build.py` is two-pass on purpose: after the first link it assembles `patch1.S`/`patch2.S`
+(the trampoline's real address text-substituted into the latter) and splices the 32 bytes into
+`patch_blob` before packing; a build without that pass ships a zeroed patch. `entry_trampoline`
+is `.align 12` (0x1000)-aligned on purpose: site2's `add r0, #lo` can only carry an 8-bit
+immediate in 16-bit form, so TRAMP's bits 0..11 must be `<= 0xFF` - which 0x1000-alignment
+guarantees (lo = 1). `build.py` asserts both bounds and fails otherwise.
 
 ## Panel (VOUT)
 
@@ -138,6 +173,10 @@ A second table, `melody_pllsai_timeout`, plays instead if PLLSAI never reported 
 unmistakably different by ear from "ta-daa", a cheap audible yes/no with no UART involved). Useful as a template for
 further "which branch did it take" diagnostics without adding real logging.
 
+A third table, `melody2`, plays from `entry_trampoline` just before the stock firmware takes over (the loader hook
+above): a short rising chime in the 2-4 kHz range, deliberately unlike "ta-daa", so a successful cold boot ends with
+an audible "done" right before the stock splash.
+
 ## Build
 
 Toolchain: `arm-none-eabi-gcc` / `arm-none-eabi-objcopy` (Cortex-M4, thumb). The source is pure assembly on purpose: a C
@@ -158,9 +197,14 @@ data - add another one if this error reappears after adding more code.
 
 ```
 make elf                              # stage1_loader.elf only (objdump / gdb); fails if the image reaches 0x1C8
-make                                  # build.py: gcc -> elf -> bin -> pad -> fw_pack.pack -> TFWriter_AiHmiT7.bin.make
+make                                  # build.py: gcc -> elf -> patch blob -> bin -> pad -> fw_pack.pack -> TFWriter_AiHmiT7.bin.make
 python3 build.py -o out.make          # same, to a path of your choice
 ```
+
+The `patch blob` step is pass 2 of `build.py`: after the first link it assembles the two site files
+(`patch1.S` → 24 B, `patch2.S` → 8 B, the trampoline's real address text-substituted into the latter) and splices
+them into `patch_blob` before objcopy, so the loader hook (above) carries the trampoline's real address. Every byte
+except site2's three immediates is fixed.
 
 Copy the resulting `TFWriter_AiHmiT7.bin.make` to the root of a FAT-formatted SD card and power the screen up with the card
 inserted. Remove the card and the screen boots from its flash as before; the flash is not touched.
@@ -174,7 +218,7 @@ inserted. Remove the card and the screen boots from its flash as before; the fla
 * The panel colour fill is confirmed visually (plain red, a full-screen framebuffer fill, and legible text, all shown
   correctly) but not measured for exact timing margins - it is plausible this works with some slack in the
   HSYNC/VSYNC/porch values rather than needing them exact.
-* The touch controller (software I2C, see the `touch-hardware-i2c` project memory) has not been wired into `stage1.S`
-  at all yet.
-* The font only covers the letters "HELLO WORLD" needs (H, E, L, O, W, R, D, space); anything else renders blank.
-  Fine for more test strings made of those letters, not a general-purpose font yet.
+* Touch is wired in (software I2C bring-up + bounded wait, see the `touch-hardware-i2c` project memory) but does not
+  yet detect real touches on this unit - the wait currently just times out (~3.3 s, shorted ~3x from 10 s).
+* The font covers the "HELLO WORLD" letters plus hex digits 0-9 and A/B/C/F plus a colon (for the identifier
+  readouts; D/E render blank). Not a general-purpose font yet.

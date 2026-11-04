@@ -16,8 +16,8 @@ BUILD    = $(PY) build.py
 
 all: $(OUTPUT)
 
-# build.py compiles, packs, verifies, and writes OUTPUT (default repo-root image).
-$(OUTPUT): $(SOURCE) linker.ld build.py
+# build.py compiles, patches, packs, verifies, and writes OUTPUT (default repo-root image).
+$(OUTPUT): $(SOURCE) linker.ld build.py patch1.S patch2.S
 	$(BUILD) -o $@ -s $(SOURCE)
 
 # Convenience: rebuild the ELF only (objdump / gdb).
