@@ -6,14 +6,11 @@
 #   hmi_extract.py extract widgets from a .tft
 #   screen_probe.py      serial link probing / flashing
 #   screen_bridge.py     JPEG + exp0/ref mirror (older approach)
-#   screen_fastblit.py   RLE fast-blit mirror (newer, lower latency)
 
 from . import screen_probe
 from . import screen_bridge
-from . import screen_fastblit
 
 __all__ = [
     'screen_probe',
-    'screen_bridge',
-    'screen_fastblit',
+    'screen_bridge'
 ]

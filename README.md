@@ -17,7 +17,7 @@ part of the framework.
 
 - `stage1/` — stage1 bootloader
 - `tools/` — Python tools (see below)
-- `kitchen/` — git-ignored scratch: KlipperScreen bridge, fast-blit firmware build, test images
+- `kitchen/` — git-ignored scratch: KlipperScreen bridge, test images
 - `TFWriter_*.bin.make` — reference firmware images for the SD-card loader
 - `nanachi_raw.rgb565` — reference framebuffer blob
 
@@ -33,7 +33,6 @@ Flat CLI scripts. Run them from inside `tools/`, or import as a package (`tools.
 | `hmi_extract.py` | Extract embedded resources from a TJC `.HMI` project source |
 | `screen_probe.py` | Probe the serial link, flash `.tft` files, baud-rate stress test |
 | `screen_bridge.py` | Older mirror approach: JPEG + `exp0`/`ref` (needs `PIL`) |
-| `screen_fastblit.py` | Newer mirror approach: RLE fast-blit via the firmware hook (needs `numpy`) |
 
 ### Invocation
 
@@ -47,19 +46,10 @@ python3 hmi_extract.py -i project.HMI
 python3 screen_probe.py --port /dev/cu.usbmodemXXXX scan
 ```
 
-`screen_fastblit.py` and `screen_bridge.py` use package-relative imports, so run them as modules
-from the parent directory:
-
-```bash
-python3 -m tools.screen_fastblit --port /dev/cu.usbmodemXXXX --source x
-python3 -m tools.screen_bridge  --port /dev/cu.usbmodemXXXX --source pic1.jpg pic2.jpg
-```
-
 ### Dependencies
 
 - `pyserial` — serial link (`screen_probe.py`)
 - `PIL` (Pillow) — `screen_bridge.py`
-- `numpy` — `screen_fastblit.py`
 - `TFTTool` — the sibling library at the workspace root, imported by `screen_probe.py --yes-flash`
   for `.tft` checksum verification before flashing
 
@@ -71,7 +61,7 @@ pip install pyserial pillow numpy
 
 ## Firmware reference images
 
-`TFWriter_AiHmiT7.bin.make` (and the `fastblit`/`sdtest`/`poc_fill`/`stock` variants) are the
+`TFWriter_AiHmiT7.bin.make` (`sdtest`/`poc_fill`/`stock` variants) are the
 container-format images the stage 0 loader reads from a FAT SD card. Regenerate with
 `python3 tools/fw_pack.py` (see `stage1/README.md`).
 
@@ -80,7 +70,6 @@ container-format images the stage 0 loader reads from a FAT SD card. Regenerate 
 Detailed notes on the firmware, protocol and hardware:
 
 - [`docs/flash_layout.md`](docs/flash_layout.md) — 16 MiB SPI flash layout, the container/XOR/CRC scheme, how the pieces were dumped and cut out.
-- [`docs/fastblit.md`](docs/fastblit.md) — lossless partial-update screen protocol, firmware hooks, host tools, measurements.
 - [`docs/commands.md`](docs/commands.md) — every serial command and system variable this firmware knows, tagged with confidence.
 - [`docs/porting.md`](docs/porting.md) — porting guide (FatFs, SD on SPI, UART buffer).
 - [`docs/test-bench.md`](docs/test-bench.md) — unattended hardware loop (USB relay, camera, ESP32 bridge), serial traps, dead ends.

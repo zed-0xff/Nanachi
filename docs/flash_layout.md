@@ -131,7 +131,7 @@ For another dump the `.tft` length is the last non-`FF` byte (`max(i for i, b in
   boot (the capture of the MCU reading the flash at start-up is in `4.txt` / `8.txt`: `03` reads of 4 bytes from `0x6FB4` up).
 
 ---
-See also: [fastblit.md](fastblit.md) (SD-boot image with the fast-blit hooks, wire protocol, firmware patch sites), [porting.md](porting.md) (boot chain, app startup/RLE layout, DOOM and OS budgets) and [test-bench.md](test-bench.md) (relay/camera/bridge bench, deploy loop, traps and dead ends).
+See also: firmware patch sites), [porting.md](porting.md) (boot chain, app startup/RLE layout, DOOM and OS budgets) and [test-bench.md](test-bench.md) (relay/camera/bridge bench, deploy loop, traps and dead ends).
 
 ## External reference: Ender Pearl display project
 

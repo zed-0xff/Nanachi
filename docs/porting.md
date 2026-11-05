@@ -1,7 +1,7 @@
 # Porting to the T7: running other things on the panel (DOOM, an OS)
 
 Two estimates of what else can run on the `TJC4827X243` (AiHmiT7) besides the stock HMI.
-Built on the forensics in `flash_layout.md` / `fastblit.md` and on the sources of the ports themselves
+Built on the forensics in `flash_layout.md` and on the sources of the ports themselves
 (`ext/nRF52840Doom`). Numbers are measurements, not marketing.
 
 ## Platform (the facts both estimates rest on)
@@ -14,7 +14,7 @@ Built on the forensics in `flash_layout.md` / `fastblit.md` and on the sources o
 | wiki's "512K runtime memory" row | the HMI app memory quota, **not** physical RAM | |
 | flash | 16 MB FM25Q128AI3, XIP at `0x10000000` (controller `0x40001000`, RDID `0x90`), status register `0x00` (nothing protected) | `flash_layout.md` |
 | peripherals | SPI `0x40003060` (SD card on SPI; the **loader carries its own FatFs**: "FAT32" string, long names, CP437), DMA2D `0x40024000` (display blit), UART (HMI serial, 4 KB buffer per wiki), touch controller, buzzer (PWM, the only audio), EEPROM 1 KB (wiki), **no RTC** (wiki: none), no Ethernet/WiFi, GPIO ≤ 8 (FPC variants may have no breakouts) | decompilation, wiki |
-| display | 480×272 RGB565; stock: double buffer in RAM + DMA2D blit (present = swap + `sub_1E9A8`); the panel interface itself (RGB LCD controller vs SPI) is not identified in the decompilation | `fastblit.md` |
+| display | 480×272 RGB565; stock: double buffer in RAM + DMA2D blit (present = swap + `sub_1E9A8`); the panel interface itself (RGB LCD controller vs SPI) is not identified in the decompilation |
 
 **Update:** the SoC is no longer unidentified. It is a **Gree Edgeless GM6721-family chip (EAI80)**, dual
 Cortex-M4, and `ext/SoC/BPI-EAI80-bsp` is the vendor's own BSP for this exact chip family: `ulibs/hal/gree`
@@ -155,7 +155,7 @@ Boot contract = the stock one (flat binary + container + loader jump).
 
 | tier | what | effort |
 |---|---|---|
-| 0 | own SD-boot C supervisor: shell over UART + FatFs (SD) + running flat/ELF binaries; 10–50 KB | **days** (SD-boot mechanism proven — `fastblit.md`) |
+| 0 | own SD-boot C supervisor: shell over UART + FatFs (SD) + running flat/ELF binaries; 10–50 KB | |
 | 1a | **Zephyr** board bring-up | **revised down, unverified**: the vendor's own fork ("ugelis") already has `dts`+drivers for this SoC family (`boards/arm/bpi_eai80_qfn80pin`) — the work is now adapting its board file to this screen's pinout and to our loader's boot contract (own linker script + entry, not a stock Zephyr boot), not writing drivers from scratch. Nobody has attempted building or booting it here yet, so treat this as optimistic until tried |
 | 1b | **NuttX** bring-up (busybox + elfffs on the NOR + SD) — the most "router-like" | **2–4 weeks** |
 | 2 | **mainline Linux** via the jserv recipe (bootwrapper role → our loader; drivers; MTD + fbdev + input) | **1–3 months** |
@@ -190,5 +190,4 @@ computer (shell + files + games) and the HMI becomes just one of its apps.
 
 ---
 
-See also: `flash_layout.md` (what is where in the flash), `fastblit.md` (SD-boot image, the display path),
-`test-bench.md` (the hardware loop).
+See also: `flash_layout.md` (what is where in the flash), `test-bench.md` (the hardware loop).

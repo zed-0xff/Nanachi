@@ -1,7 +1,7 @@
 # Hardware test bench and debugging notes (Sovol/TJC screen, fast-blit work)
 
 Everything needed to iterate on the SD-boot image **unattended**, plus the traps found while doing it. Companion to
-`fastblit.md` (protocol/firmware) and `flash_layout.md` (flash/loader layout).
+`flash_layout.md` (flash/loader layout).
 
 ## Bench
 
@@ -14,7 +14,7 @@ Docker: ks_docker (KlipperScreen + Xvfb 480x272, TCP 6099)  <-  Moonraker 192.16
 
 ## Deploy / test loop
 
-1. `python3 tools/fastblit_fw/build.py` -> `TFWriter_AiHmiT7_fastblit.bin.make` in the repo root.
+1. `python3 build.py` -> `TFWriter_AiHmiT7.bin.make`
 2. Deploy.
 3. Confirm the new image is really what runs. `rest` -> **no reply** = patched image (CPU reset);
    `invalid instruction` = stock. **Byte count alone is not a discriminator** — a dropped command looks identical
@@ -67,18 +67,13 @@ These were hypotheses chased for hours that turned out wrong; most were symptoms
 - "The loader consumes (renames) the SD file after one boot": false (the `.tm` came from the `--raw` upload).
 - "SCRATCH (0x400000) is not executable" (from the abandoned `exec` experiment): unproven, its hangs were `--raw`.
 - 3-4 letter command names: never matched (parser only passes 5-8 char words).
-- Drawing from the `sub_5538` completion context: never visible (see `fastblit.md`), not a timing issue.
 
 ## Buzzer / "haptic"
 
 There is no vibration motor in the firmware. A buzzer exists and works: `beep <ms>` is accepted (`instruction
 successful` at `bkcmd=3`); the duration argument is ignored — every beep sounds the same (200 vs 100/500 ms all
 alike, heard on the bench). `iobeep` is `invalid instruction` as typed (hidden command, syntax unknown); `beepset
-<freq>,<dur>` untried. A touch-click (`beep 20` on every press) was added to `screen_fastblit.py` as `--click` (default
-off): both unexplained failures of 2026-10-23 — the screen reset to the boot picture (Nanachi) mid-run, and then the
-ESP32 and relay USB ports vanishing — happened only in runs with the click enabled, while the earlier all-day runs without
-it were stable. Suspected power dip from the buzzer on a shared supply; **unproven**. If the click is wanted, check
-supply/USB power first.
+<freq>,<dur>` untried.
 
 ## KlipperScreen in Docker
 
