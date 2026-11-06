@@ -13,11 +13,13 @@
  *   .text:      install_peek_hook (cold pass) / install_peek_blob (stock pass)
  *   .peekblob:  peekblob_entry (dispatch) -> .pb_replay, pb_exit, pb_exit_err, pb_window,
  *               pk_marker, pk_hex_table, pk_dec_table,
- *               then cmd_peek.S (pb_peek) and cmd_poke.S (pb_poke), included here so the
- *               whole blob stays one word-copyable block. The section must stay <= 0x428 and
- *               end 4-aligned: the word copy at the stock hand-off is word-granular, and
- *               0x79D870 (PEEK_BLOB_DST + 0x428) is the proven-safe envelope edge - anything
- *               past it clobbers live stock parser state (bench-confirmed dead parser).
+ *               then cmd_peek.S (pb_peek), cmd_poke.S (pb_poke) and cmd_fun.S (pb_fun),
+ *               included here so the whole blob stays one word-copyable block. The section
+ *               must end 4-aligned (the word copy at the stock hand-off is word-granular)
+ *               and its end must stay < PEEK_BLOB_END (0x7DF000, the stock stack floor):
+ *               the safe gap is 0x79D438..0x7DF000 (above the bss top, below the stack floor
+ *               - see build.py), so the blob may grow well past the old 0x428 design cap.
+ *               build.py asserts PEEK_BLOB_DST + size <= PEEK_BLOB_END.
  *
  * Entry state (IDA cmd_lookup 0x2898): r0=dst slot, r1=strings41, r2=0x29, r3=2, r5=line base,
  * r6=&u16 field byte-offset, r7=g_widget_property (0x77F3B0), lr=0x2A23. The token is the
@@ -38,8 +40,8 @@
  * pk_marker is a leaf clobbering r0-r3. All intra-blob refs are PC-relative (bl/bx/ADR);
  * all absolute literals are fixed values; no pool may point into the image.
  *
- * Non-local symbols (reachable from the other .include files): pb_peek, pb_poke, pb_window,
- * pb_exit, pb_exit_err, pk_marker, pk_hex_table, pk_dec_table.
+ * Non-local symbols (reachable from the other .include files): pb_peek, pb_poke, pb_fun,
+ * pb_window, pb_exit, pb_exit_err, pk_marker, pk_hex_table, pk_dec_table.
  * (GAS scopes .local labels per .include file, so anything called across files must be
  * non-local.) */
 
@@ -149,17 +151,45 @@ peekblob_entry:
     ldrh r0, [r6]
     ldr r7, [sp, #20]                  // entry r5 = the line base
     add r7, r7, r0                     // r7 = the current field's start
-    // ---- "peek " / "poke " dispatch: ALL FIVE chars must match before we commit (a
-    // partial match falls to .pb_replay). The 2nd char picks the candidate word.
+    // ---- "peek " / "poke " / "funN " / "furN " dispatch: ALL FIVE chars must match before
+    // we commit (a partial match falls to .pb_replay). The 1st char picks the family (p/f),
+    // the 2nd the candidate word (p->e/o, f->u).
     ldrb r0, [r7]
     cmp r0, #'p'
-    bne .pb_replay
+    beq .pb_p_tok
+    cmp r0, #'f'
+    beq .pb_f_tok
+    b .pb_replay
+.pb_p_tok:
     ldrb r1, [r7, #1]
     cmp r1, #'e'
     beq .pb_peek_tok
     cmp r1, #'o'
     beq .pb_poke_tok
     b .pb_replay
+.pb_f_tok:
+    ldrb r1, [r7, #1]
+    cmp r1, #'u'
+    bne .pb_replay
+    ldrb r1, [r7, #3]                 // the N digit: 0-2
+    cmp r1, #'0'
+    blt .pb_replay
+    cmp r1, #'2'
+    bhi .pb_replay
+    ldrb r2, [r7, #4]
+    cmp r2, #' '
+    bne .pb_replay
+    subs r4, r1, #'0'                 // r4 = N (0-2)
+    ldrb r2, [r7, #2]                 // 'n' (fun) or 'r' (fur)
+    cmp r2, #'r'
+    beq .pb_f_r
+    movs r5, #0                       // fun: discard the return
+    b .pb_f_go
+.pb_f_r:
+    movs r5, #1                       // fur: print the return
+.pb_f_go:
+    bl pb_fun                         // "funN "/furN " confirmed: parse + call in cmd_fun.S
+    b pb_exit
 .pb_poke_tok:
     ldrb r1, [r7, #2]
     cmp r1, #'k'
@@ -335,6 +365,7 @@ pk_dec_table:
  * what they call (pb_window/pb_exit/pb_exit_err/pk_marker/pk_hex_table). */
 .include "cmd_peek.S"
 .include "cmd_poke.S"
+.include "cmd_fun.S"
     .align 2                  // end the section 4-aligned: the word copy at the stock
                               // hand-off is word-granular, a partial tail word would
                               // overwrite live stock data past the blob

@@ -72,6 +72,12 @@ PEEK_ORIGINAL_WORD = 0xFD7DF001
 # Thumb BL (T1) has a +/-16 MB (±0x1000000) PC-relative range, verified against the stock's own
 # original word (0xFD7DF001 re-derives to 0x451D with the same encoder below).
 PEEK_BLOB_DST = 0x79D448
+# The safe gap the blob may occupy: 0x79D438..0x7DF000 (above the bss top, below the stock's
+# stack floor 0x7DF000 - SP starts at 0x800000). The blob's runtime end must stay at or below
+# PEEK_BLOB_END. The old 0x428 "cap" in cmd.S was a conservative design limit, not a memory
+# wall; this asserts the real boundary so an over-large blob fails loudly instead of clobbering
+# live stock state past the gap.
+PEEK_BLOB_END = 0x7DF000
 
 ASFLAGS = ["-mcpu=cortex-m4", "-mthumb"]
 
@@ -291,6 +297,22 @@ def build(output, source=SOURCE, original_word=None):
     for name in ("entry_trampoline", "patch_blob"):
         if name not in syms:
             sys.exit(f"error: symbol {name} not found in {ELF}")
+    # the .peekblob blob is word-copied to PEEK_BLOB_DST at the stock hand-off; its size is the
+    # LMA range. It must be 4-byte-aligned (word copy) and end at or below PEEK_BLOB_END (the
+    # safe gap's upper edge, the stock's stack floor) - a larger blob would clobber live stock
+    # state past the gap.
+    for _nm in ("__peekblob_lma", "__peekblob_end"):
+        if _nm not in syms:
+            sys.exit(f"error: symbol {_nm} not found in {ELF}")
+    blob_size = syms["__peekblob_end"] - syms["__peekblob_lma"]
+    if blob_size & 3:
+        sys.exit(f"error: .peekblob size 0x{blob_size:x} is not 4-byte aligned (word copy)")
+    if PEEK_BLOB_DST + blob_size > PEEK_BLOB_END:
+        sys.exit(f"error: .peekblob end 0x{PEEK_BLOB_DST + blob_size:x} exceeds the safe gap "
+                 f"end PEEK_BLOB_END=0x{PEEK_BLOB_END:x} (size 0x{blob_size:x})")
+    print(f"  .peekblob: 0x{blob_size:x} bytes @ LMA 0x{syms['__peekblob_lma']:x} -> "
+          f"runtime 0x{PEEK_BLOB_DST:x}..0x{PEEK_BLOB_DST + blob_size:x} (gap end "
+          f"0x{PEEK_BLOB_END:x})")
     tramp = syms["entry_trampoline"] | 1  # Thumb bit for the blx
     # the 0x2A1E branch is a 32-bit Thumb BL (T1): offset = SignExt24(S:I1:I2:imm10:imm11) << 1,
     # so +/-0x1000000 (16 MB) of PC-relative reach from 0x2A22. PEEK_BLOB_DST (0x79D448) is
