@@ -6,7 +6,7 @@
  *   len:  decimal, 1..PEEK_MAX_LEN
  * Reply:  one 0x5A beacon (every 0x2A1E hit), then dump frames
  *         72 <n> <n data bytes> FF FF FF (n <= 255; every full chunk is n = 0xFF),
- *         or the error frame 72 FF FF FF on bad syntax / outside the readable windows,
+ *         or the error frame 72 FF FF FF on bad syntax,
  *         then the stock's own 00 invalid-instruction ack (r0 = -1 = not found).
  *
  * Called with bl from peekblob_entry (cmd.S). `bl` does not push a frame, so sp is the entry
@@ -15,7 +15,7 @@
  * *(u16*)r6) and which the bl preserves - no stack re-read (r5/r6 stay in their entry-frame
  * slots; only r7 is needed live).
  *
- * This file references only cmd.S symbols (pb_exit, pb_exit_err, pb_window, pk_marker,
+ * This file references only cmd.S symbols (pb_exit, pb_exit_err, pk_marker,
  * pk_hex_table, pk_dec_table) and its own locals - nothing from cmd_poke.S. */
 
 .equ PEEK_MAX_LEN, 0x4000
@@ -23,7 +23,7 @@
 .thumb_func
 pb_peek:
     // sp is the entry frame (peekblob_entry's push {r0-r7,lr}); `bl` does NOT push a frame,
-    // so there is nothing to discard here or in pb_window - sp must stay at the entry frame
+    // so there is nothing to discard here - sp must stay at the entry frame
     // for the terminal pop in pb_exit. r7 = the field start (the 'p' of "peek"), set by the
     // entry and preserved across the bl (the bl clobbers only lr). No stack re-read needed.
     // ---- parse "<addr>,<len>" after the token: one space, hex addr (0x optional), comma,
@@ -89,10 +89,6 @@ pb_peek:
     cmp r0, #PEEK_MAX_LEN
     bhs .pp_err
     mov r5, r0                         // r5 = len
-    // ---- window check (cmd.S, leaf): r4 = addr, r5 = len; out r3 = 0 ok / 1 err.
-    bl pb_window
-    cmp r3, #0
-    bne .pp_err
     // ---- dump: read the source straight out, chunked 72 <n> <data> FF FF FF frames, each
     // byte via pk_marker (the raw UART2 write). pk_marker clobbers r0-r3 only, so r4/r5/r6
     // survive every call (the dump loop's live registers).

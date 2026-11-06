@@ -9,7 +9,7 @@
  * Behavior: the FULL data is validated before any store (no partial writes on bad input).
  *   success: NO reply frame (one 0x5A beacon only, like every 0x2A1E hit) - the write
  *            happens, then the stock's 00 ack follows; the host verifies with a peek.
- *   error:   72 FF FF FF (bad syntax / short data / N > 255 / outside the writable windows),
+ *   error:   72 FF FF FF (bad syntax / short data / N > 255),
  *            then the stock's 00 ack.
  * Bench truth (2026-11-06, stock pass): only W2 (SRAM0, 0x20000000) is writable; stores into
  * W3 (PSRAM) / W4 / W1 (flash) are silently dropped (no fault, no IWDG).
@@ -19,10 +19,9 @@
  * terminal pop. It uses r7 = the field start, which the entry already computed (r5 +
  * *(u16*)r6) and which the bl preserves - no stack re-read (see the pb_peek header). Register
  * plan after the parse: r4 = addr, r5 = N, r6 = data
- * start, r2 = data end. pb_window (cmd.S leaf) clobbers only r1,r2 - so the data start
- * is saved in r6 before the call.
+ * start, r2 = data end.
  *
- * This file references only cmd.S symbols (pb_exit, pb_exit_err, pb_window, pk_marker,
+ * This file references only cmd.S symbols (pb_exit, pb_exit_err, pk_marker,
  * pk_hex_table) and its own locals - nothing from cmd_peek.S. */
 
 .equ POKE_MAX_LEN, 255
@@ -30,7 +29,7 @@
 .thumb_func
 pb_poke:
     // sp is the entry frame (peekblob_entry's push {r0-r7,lr}); `bl` does NOT push a frame,
-    // so there is nothing to discard here or in pb_window - sp must stay at the entry frame
+    // so there is nothing to discard here - sp must stay at the entry frame
     // for the terminal pop in pb_exit. r7 = the field start (the 'p' of "poke"), set by the
     // entry and preserved across the bl (the bl clobbers only lr). No stack re-read needed.
     add r7, r7, #5                     // r7 = just past "poke " (the addr start)
@@ -130,11 +129,6 @@ pb_poke:
     add r7, r7, #1                     // advance (a beq-without-advance = infinite loop)
     b .np_data_pre
 .np_have_data:
-    // ---- window check (cmd.S, leaf): r4 = addr, r5 = N; clobbers r1,r2 only - r5 (N) and
-    // r6 (data start) survive, so the data end is computed right after the check.
-    bl pb_window
-    cmp r3, #0
-    bne .np_err
     lsl r2, r5, #1                     // r2 = 2N (the data is 2N hex chars, not N)
     add r2, r6, r2                     // r2 = data end (r6 + 2N): the store cursor steps 2/byte
     // ---- write: N strb stores (no alignment requirement). The bytes were validated above,

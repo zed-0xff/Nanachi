@@ -11,7 +11,7 @@
  *
  * Layout:
  *   .text:      install_peek_hook (cold pass) / install_peek_blob (stock pass)
- *   .peekblob:  peekblob_entry (dispatch) -> .pb_replay, pb_exit, pb_exit_err, pb_window,
+ *   .peekblob:  peekblob_entry (dispatch) -> .pb_replay, pb_exit, pb_exit_err,
  *               pk_marker, pk_hex_table, pk_dec_table,
  *               then cmd_peek.S (pb_peek), cmd_poke.S (pb_poke) and cmd_fun.S (pb_fun),
  *               included here so the whole blob stays one word-copyable block. The section
@@ -28,20 +28,19 @@
  *
  * Stack discipline: peekblob_entry pushes {r0-r7,lr} (36 B) once and never pops; sp is that
  * frame top for the whole dispatch. `bl` does NOT push a frame (it only sets lr), so
- * pb_peek/pb_poke/pb_window must NOT move sp: they take the field start in r7 (the entry
+ * pb_peek/pb_poke must NOT move sp: they take the field start in r7 (the entry
  * computed it, r5 + *(u16*)r6, and the bl preserves r7), run with sp at the entry frame, and
  * leave it there for the terminal pop. The v2t/v2u incident: each of them did an unbalanced
  * "add sp,#4 to discard the bl frame" - shifting sp off the entry frame so pb_exit's
  * pop {r0-r7,lr} read lr from the wrong slot and `bx lr` jumped into 0x77F3B0 data (hang,
  * IWDG reboot, silence). Those adds are removed: pb_exit/pb_exit_err now pop the intact
  * entry frame and return r0=-1 to lr=0x2A23 (the stock's get_String8 not-found value; the
- * stock's 00 ack follows). pb_window: no push, no sp move; in r4=addr, r5=len; out
- * r3=0 ok / 1 err; clobbers r1,r2.
+ * stock's 00 ack follows).
  * pk_marker is a leaf clobbering r0-r3. All intra-blob refs are PC-relative (bl/bx/ADR);
  * all absolute literals are fixed values; no pool may point into the image.
  *
  * Non-local symbols (reachable from the other .include files): pb_peek, pb_poke, pb_fun,
- * pb_window, pb_exit, pb_exit_err, pk_marker, pk_hex_table, pk_dec_table.
+ * pb_exit, pb_exit_err, pk_marker, pk_hex_table, pk_dec_table.
  * (GAS scopes .local labels per .include file, so anything called across files must be
  * non-local.) */
 
@@ -50,25 +49,14 @@
 .equ PEEK_BLOB_DST,    0x79D448       // the safe gap in the firmware's BSS/heap zone (bench-safe)
 .equ GET_STRING8_ADDR, 0x451D         // the original BL.W's target (odd = Thumb)
 
-/* The five memory windows (see the peek header in stage1.S; bench-confirmed 2026-11-06):
- * W0 = [0, 0x20000)              the 0x0 SRAM0 alias (loader pass only; in the stock pass it
- *                                maps to the APP's own vector region, NOT to 0x20000000)
- * W1 = [0x10000000, +0x10000)    the 0x10000000 window (the stock maps its boot vectors there)
- * W2 = [0x20000000, +0x10000)    SRAM0 (128 KB, dts DT_SRAM_SIZE) - the ONLY writable window
- * W3 = [0x40000000, +0x10000)    PSRAM window
- * W4 = [0xE0000000, +0x10000000) flash XIP (0xE0000000 = the 16 MiB SPI flash base)
- * W2/W3/W4 are the only windows the stock pass honors; stores into W3/W4 are silently
- * dropped (no fault, no IWDG) - bench-confirmed 2026-11-06 (v2p). */
-.equ PEEK_W0_LO, 0x0
-.equ PEEK_W0_HI, 0x20000
-.equ PEEK_W1_LO, 0x10000000
-.equ PEEK_W1_HI, 0x10010000
-.equ PEEK_W2_LO, 0x20000000
-.equ PEEK_W2_HI, 0x20010000
-.equ PEEK_W3_LO, 0x40000000
-.equ PEEK_W3_HI, 0x40010000
-.equ PEEK_W4_LO, 0xE0000000
-.equ PEEK_W4_HI, 0xF0000000
+/* No window gating (since v3): peek/poke accept ANY parsed address - the former
+ * six-window check (W0 0x0-alias / W1 0x10000000 / W2 SRAM0 0x20000000 /
+ * W3 0x40000000 / W4 flash 0xE0000000 / W5 arena 0x20000-0x800000) was removed
+ * on request, so the host can reach the whole map - in particular the VOUT
+ * register block at 0x40026000 (CFBAR at +0x50 = the live framebuffer address).
+ * Known writability (stock pass): SRAM0 yes; PSRAM/flash stores silently
+ * dropped; the SDRAM arena (0x0..0x800000) untested as of v2z. The len/syntax
+ * checks (PEEK_MAX_LEN/POKE_MAX_LEN) remain. */
 
 /* --------------------------------------------------------------------------
  *  install_peek_hook: the COLD pass's peek setup, right after install_entry_hook. Stores the
@@ -255,59 +243,6 @@ pb_exit_err:
     b pb_exit
 
 /* --------------------------------------------------------------------------
- *  pb_window: the shared window check (peek: len bytes; poke: N bytes - the whole range
- *  addr..addr+len must stay inside one window). No push of its own and NO sp adjustment:
- *  `bl` does not push a frame, so sp is the caller's entry frame throughout and must be left
- *  untouched for the terminal pop in pb_exit. In: r4=addr, r5=len. Out: r3 = 0 ok / 1 err.
- *  Clobbers r1,r2 only. Ok: bx lr with r3=0; err: b pb_exit_err. */
-.thumb_func
-pb_window:
-    movs r2, #0x2000
-    lsl r2, r2, #4                     // r2 = 0x20000 (window 0 = the 0x0 SRAM0 alias end)
-    cmp r4, r2
-    blo .pw_ok
-    ldr r1, =PEEK_W1_LO
-    cmp r4, r1
-    blo .pw_err
-    ldr r2, =PEEK_W1_HI
-    cmp r4, r2
-    bhs .pw_w2
-    b .pw_ok
-.pw_w2:
-    ldr r1, =PEEK_W2_LO
-    cmp r4, r1
-    blo .pw_err
-    ldr r2, =PEEK_W2_HI
-    cmp r4, r2
-    bhs .pw_w3
-    b .pw_ok
-.pw_w3:
-    ldr r1, =PEEK_W3_LO
-    cmp r4, r1
-    blo .pw_err
-    ldr r2, =PEEK_W3_HI
-    cmp r4, r2
-    bhs .pw_w4
-    b .pw_ok
-.pw_w4:
-    ldr r1, =PEEK_W4_LO
-    cmp r4, r1
-    blo .pw_err
-    ldr r2, =PEEK_W4_HI
-    cmp r4, r2
-    bhs .pw_err
-    b .pw_ok                           // W4 (flash) needs the same jump to .pw_ok as W1-W3
-.pw_err:
-    b pb_exit_err
-.pw_ok:
-    add r1, r4, r5                     // addr + len must stay inside the window
-    cmp r1, r2
-    bhi .pw_err
-    movs r3, #0
-    bx lr
-    .ltorg
-
-/* --------------------------------------------------------------------------
  *  pk_marker(r0 = byte): the relocated blob's own uart_putc. The blob cannot reuse the
  *  in-image uart_putc/send_resp (the image at 0x80000 is clobbered by the stock boot), so
  *  it re-derives the UART2 TX here: poll UART2_TH's TX FIFO fill level (the exact wait
@@ -362,7 +297,7 @@ pk_dec_table:
 
 /* The theme files: same section (.peekblob), same translation unit. Each holds only its
  * theme's functions (no cross-references between them); the shared scaffolding above is
- * what they call (pb_window/pb_exit/pb_exit_err/pk_marker/pk_hex_table). */
+ * what they call (pb_exit/pb_exit_err/pk_marker/pk_hex_table). */
 .include "cmd_peek.S"
 .include "cmd_poke.S"
 .include "cmd_fun.S"
