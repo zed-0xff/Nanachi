@@ -270,6 +270,69 @@ def cmd_peek(a):
         print(f"  (unparsed tail: {junk.hex(' ')})")
 
 
+def cmd_poke(a):
+    s = Screen(a.port, a.baud or 115200, a.verbose)
+    data = a.data
+    if data[:2].lower() == "0x":
+        data = data[2:]
+    if not data or len(data) % 2 or len(data) > 2 * 255:
+        print(f"poke: data must be 1-255 bytes of hex (2 digits per byte, no 0x/spaces); refusing")
+        return
+    if not all(c in "0123456789abcdefABCDEF" for c in data):
+        print(f"poke: data must be hex digits only; refusing")
+        return
+    value = bytes.fromhex(data)
+    # The blob answers a success with NO frame (the Z beacon only) - the write happened;
+    # an error (bad syntax / N > 255 / outside the writable windows) is one 72 FF FF FF
+    # frame. _peek_parse splits both: a success is beacons with zero chunks.
+    cmd = f"poke 0x{a.addr:x},{len(value)},{data.upper()}"
+    s.ser.reset_input_buffer()
+    s.buf = b""
+    s.send(cmd)
+    raw, last = b"", time.time()
+    end = time.time() + a.wait
+    while time.time() < end:
+        c = s.ser.read(256)
+        if c:
+            raw += c
+            last = time.time()
+        elif raw and time.time() - last > 0.3:
+            break
+    dump, err, beacons, junk = _peek_parse(raw)
+    if beacons:
+        print(f"  (0x5A beacon x{beacons}: the poke blob ran)")
+    if err:
+        print(f"poke {cmd}: {err}")
+    elif beacons and not dump:
+        print(f"poke {cmd}: ok ({len(value)} bytes to 0x{a.addr:08x}; no reply frame - the write is not echoed)")
+        if a.verify:
+            s.buf = b""
+            v = f"peek 0x{a.addr:x},{len(value)}"
+            s.send(v)
+            raw, last = b"", time.time()
+            vend = time.time() + a.wait
+            while time.time() < vend:
+                c = s.ser.read(256)
+                if c:
+                    raw += c
+                    last = time.time()
+                elif raw and time.time() - last > 0.3:
+                    break
+            vd, verr, vbeacons, _ = _peek_parse(raw)
+            if vd == value:
+                print(f"  verify: peek matches the written data")
+            else:
+                print(f"  verify: peek differs (wrote {value.hex(' ')}, read {vd.hex(' ') if vd else 'NO DATA'}"
+                      f"{' - the window is read-only (store dropped)' if vd else ''})")
+    elif not dump:
+        print(f"poke {cmd}: no beacon (is the stage1 image with the poke blob running?)")
+    else:
+        print(f"poke {cmd}: unexpected frame: {dump.hex(' ')}")
+    junk = bytes(b for b in junk if b != 0x00)      # the 00 invalid-instruction ack is expected after a poke
+    if junk:
+        print(f"  (unparsed tail: {junk.hex(' ')})")
+
+
 def read_acks(ser, timeout, seen=None):
     """Waits for the answer of the file transfer: 0x05 ok, 0xfd (FD FF FF FF, transfer finished) ok, 0x04 failed; None on timeout. Every other
     byte that arrives is appended to seen (a bytearray) so that a failure can show what the screen said."""
@@ -574,6 +637,12 @@ def main():
     k.add_argument("length", type=lambda s: int(s, 0), help="bytes to dump (must be < 0x4000 and inside one readable window)")
     k.add_argument("--wait", type=float, default=3.0, help="max seconds to wait for the dump (a 0.3 s quiet period ends it early)")
     k.set_defaults(fn=cmd_peek)
+    pk = sub.add_parser("poke", help="write N bytes (hex) to panel memory (needs the stage1 image's peek/poke blob running); a success answers no frame, --verify re-reads with peek")
+    pk.add_argument("addr", type=lambda s: int(s, 0), help="start address (0x hex or decimal), inside one readable window (no alignment needed)")
+    pk.add_argument("data", help="the bytes to write as hex, 1-255 bytes (2 digits per byte; an optional 0x prefix is fine)")
+    pk.add_argument("--verify", action="store_true", help="after a successful poke, peek the range back and compare")
+    pk.add_argument("--wait", type=float, default=3.0, help="max seconds to wait for the readback (a 0.3 s quiet period ends it early)")
+    pk.set_defaults(fn=cmd_poke)
     u = sub.add_parser("upload")
     u.add_argument("file")
     u.add_argument("--target", default="ram/probe.jpg")

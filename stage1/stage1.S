@@ -1434,7 +1434,7 @@ uart_puts:
 .equ ICACHE_SR, 0xE0042104
 .equ CPU_CACHECTR, 0xE0042024
 
-.include "cmd_peek.S"
+.include "cmd.S"
 
 /* --------------------------------------------------------------------------
  *  melody_play: self-contained TIM5 note player, shared by entry's 1st melody and

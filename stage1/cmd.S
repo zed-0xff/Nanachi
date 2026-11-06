@@ -1,0 +1,343 @@
+/* cmd.S - the 0x2A1E command blob: shared scaffolding (included by stage1.S at its former
+ * cmd_peek.S site, the same translation unit, no .globl anywhere in the chain).
+ *
+ * One contiguous .peekblob section, word-copied at the stock hand-off (install_peek_blob) to
+ * PEEK_BLOB_DST (a safe gap that survives the stock boot; the image at 0x80000 is clobbered).
+ * Entry: build.py hand-encodes a 32-bit BL for the original BL.W at 0x2A1E in ldr_exec_'s
+ * sub_2898 (cmd_lookup, the ASCII command parser) -> peekblob_entry. The blob is the sole
+ * peek/poke implementation and the sole live TX path: its reply goes out the raw pk_marker
+ * write to UART2_DR (v2l proved that reaches the bench in the stock pass; the image's
+ * send_resp dies when the stock clobbers 0x80000).
+ *
+ * Layout:
+ *   .text:      install_peek_hook (cold pass) / install_peek_blob (stock pass)
+ *   .peekblob:  peekblob_entry (dispatch) -> .pb_replay, pb_exit, pb_exit_err, pb_window,
+ *               pk_marker, pk_hex_table, pk_dec_table,
+ *               then cmd_peek.S (pb_peek) and cmd_poke.S (pb_poke), included here so the
+ *               whole blob stays one word-copyable block. The section must stay <= 0x428 and
+ *               end 4-aligned: the word copy at the stock hand-off is word-granular, and
+ *               0x79D870 (PEEK_BLOB_DST + 0x428) is the proven-safe envelope edge - anything
+ *               past it clobbers live stock parser state (bench-confirmed dead parser).
+ *
+ * Entry state (IDA cmd_lookup 0x2898): r0=dst slot, r1=strings41, r2=0x29, r3=2, r5=line base,
+ * r6=&u16 field byte-offset, r7=g_widget_property (0x77F3B0), lr=0x2A23. The token is the
+ * field at R5 + *(u16*)R6; after the entry push the slots the code reads are [sp,#20]=r5
+ * and [sp,#24]=r6 (slot values bench-verified against the green baseline).
+ *
+ * Stack discipline: peekblob_entry pushes {r0-r7,lr} (36 B) once and never pops; sp is that
+ * frame top for the whole dispatch. `bl` does NOT push a frame (it only sets lr), so
+ * pb_peek/pb_poke/pb_window must NOT move sp: they take the field start in r7 (the entry
+ * computed it, r5 + *(u16*)r6, and the bl preserves r7), run with sp at the entry frame, and
+ * leave it there for the terminal pop. The v2t/v2u incident: each of them did an unbalanced
+ * "add sp,#4 to discard the bl frame" - shifting sp off the entry frame so pb_exit's
+ * pop {r0-r7,lr} read lr from the wrong slot and `bx lr` jumped into 0x77F3B0 data (hang,
+ * IWDG reboot, silence). Those adds are removed: pb_exit/pb_exit_err now pop the intact
+ * entry frame and return r0=-1 to lr=0x2A23 (the stock's get_String8 not-found value; the
+ * stock's 00 ack follows). pb_window: no push, no sp move; in r4=addr, r5=len; out
+ * r3=0 ok / 1 err; clobbers r1,r2.
+ * pk_marker is a leaf clobbering r0-r3. All intra-blob refs are PC-relative (bl/bx/ADR);
+ * all absolute literals are fixed values; no pool may point into the image.
+ *
+ * Non-local symbols (reachable from the other .include files): pb_peek, pb_poke, pb_window,
+ * pb_exit, pb_exit_err, pk_marker, pk_hex_table, pk_dec_table.
+ * (GAS scopes .local labels per .include file, so anything called across files must be
+ * non-local.) */
+
+.equ PEEK_PATCH_SITE,  0x2A1E         // stock sub_2898: the BL.W we replace (the 0x0-alias form,
+                                      // the form both bench-verified passes write - see below)
+.equ PEEK_BLOB_DST,    0x79D448       // the safe gap in the firmware's BSS/heap zone (bench-safe)
+.equ GET_STRING8_ADDR, 0x451D         // the original BL.W's target (odd = Thumb)
+
+/* The five memory windows (see the peek header in stage1.S; bench-confirmed 2026-11-06):
+ * W0 = [0, 0x20000)              the 0x0 SRAM0 alias (loader pass only; in the stock pass it
+ *                                maps to the APP's own vector region, NOT to 0x20000000)
+ * W1 = [0x10000000, +0x10000)    the 0x10000000 window (the stock maps its boot vectors there)
+ * W2 = [0x20000000, +0x10000)    SRAM0 (128 KB, dts DT_SRAM_SIZE) - the ONLY writable window
+ * W3 = [0x40000000, +0x10000)    PSRAM window
+ * W4 = [0xE0000000, +0x10000000) flash XIP (0xE0000000 = the 16 MiB SPI flash base)
+ * W2/W3/W4 are the only windows the stock pass honors; stores into W3/W4 are silently
+ * dropped (no fault, no IWDG) - bench-confirmed 2026-11-06 (v2p). */
+.equ PEEK_W0_LO, 0x0
+.equ PEEK_W0_HI, 0x20000
+.equ PEEK_W1_LO, 0x10000000
+.equ PEEK_W1_HI, 0x10010000
+.equ PEEK_W2_LO, 0x20000000
+.equ PEEK_W2_HI, 0x20010000
+.equ PEEK_W3_LO, 0x40000000
+.equ PEEK_W3_HI, 0x40010000
+.equ PEEK_W4_LO, 0xE0000000
+.equ PEEK_W4_HI, 0xF0000000
+
+/* --------------------------------------------------------------------------
+ *  install_peek_hook: the COLD pass's peek setup, right after install_entry_hook. Stores the
+ *  4-byte 32-bit Thumb BL (T1) (hand-encoded by build.py for the 0x2A1E site and spliced into
+ *  patch_blob offset 32 = peek_patch_word) over the stock parser's original BL.W at 0x2A1E
+ *  (the 0x0-alias form: in the cold pass the boot-ROM alias 0x0 = SRAM0 0x20000000). The
+ *  original BL.W goes to get_String8 (0x451D), an instruction that only searches the ASCII
+ *  tables for the command and returns -1 (not found) for unknown words without touching the
+ *  line or the fields - so the detour keeps the stock's visible behavior (the "peek"/"poke"
+ *  lines are not in its table; the 00 invalid-instruction reply is sent by the stock after
+ *  we return). Leaf on purpose: at the entry call site its push {lr} (the loader's return
+ *  address) is live and must survive. The stock pass re-writes the word after the stock
+ *  boot wipes it (install_peek_blob). */
+.thumb_func
+install_peek_hook:
+    ldr r0, =peek_patch_word
+    ldr r0, [r0]
+    ldr r1, =PEEK_PATCH_SITE
+    str r0, [r1]
+    bx lr
+    .ltorg
+
+/* --------------------------------------------------------------------------
+ *  install_peek_blob: the STOCK pass's peek setup, right before the one-way jump to stock
+ *  (the stock boot has clobbered the cold pass's 0x2A1E word - the stock rewrites the
+ *  SRAM0 code region, so the word must be re-installed after the boot).
+ *   1. Word-copies the whole .peekblob section (__peekblob_lma..__peekblob_end, its LMA in
+ *      the image) to PEEK_BLOB_DST, the safe gap that survives the stock boot. The blob is
+ *      a single contiguous block (entry + peek + poke + replay + marker + tables):
+ *      all intra-blob refs are PC-relative (bl/bx/ADR), all absolute literals are fixed
+ *      values (the UART2/GPIO registers, the PEEK_W windows, GET_STRING8_ADDR) - no pool
+ *      may point into the image (the image is dead after the stock boot).
+ *   2. Re-writes the 0x2A1E BL word to target the gap copy (same 0x0-alias form as the
+ *      cold pass; bench-confirmed the word then reads back at 0x20002A1E in the stock pass).
+ *   3. I-cache reset (the shared icache_reset in stage1.S): defensive - nothing in this
+ *      boot has fetched 0x2A1E or 0x79D448 yet, but the idiom is the cache's only reset.
+ *  Push/pop {r4-r6,lr}; clobbers r0-r3 (all dead at the caller - it re-loads r0 for the
+ *  P:/R: self-check prints). */
+.thumb_func
+install_peek_blob:
+    push {r4-r6, lr}
+    ldr r4, =__peekblob_lma                  // source: the blob's home in the image
+    ldr r5, =__peekblob_end
+    subs r5, r5, r4                          // r5 = the section size (a multiple of 4)
+    ldr r6, =PEEK_BLOB_DST                   // destination: the safe gap
+    movs r0, #0
+.ipb_copy:
+    ldr r1, [r4, r0]
+    str r1, [r6, r0]
+    adds r0, r0, #4
+    cmp r0, r5
+    blo .ipb_copy
+    ldr r0, =peek_patch_word
+    ldr r0, [r0]
+    ldr r1, =PEEK_PATCH_SITE
+    str r0, [r1]                             // 0x2A1E -> BL to the gap copy
+    bl icache_reset
+    pop {r4-r6, lr}
+    bx lr
+    .ltorg
+
+/* --------------------------------------------------------------------------
+ *  .peekblob - the relocated command blob (one contiguous word-copyable block).
+ *  The blob must stay aligned 4: the word copy assumes 32-bit alignment, and the first
+ *  word of the section is the R: self-check signature the stock pass prints. */
+.section .peekblob, "a"
+.align 2
+.thumb_func
+peekblob_entry:
+    // 0x2A1E lands here (build.py's _bl_word(0x2A1E, 0x79D448)). The first two instructions
+    // are the R: self-check signature (the stock pass prints the section's first word).
+    push {r0-r7, lr}
+    // liveness beacon: one 0x5A on every 0x2A1E hit, before any dispatch (the deterministic
+    // "the blob runs" ground truth the bench greps). pk_marker clobbers r0-r3 only (all on
+    // the push), so the token check below re-reads the entry r5/r6 from the stack.
+    movs r0, #0x5a
+    bl pk_marker
+    // ---- the token is in memory at R5 + *(u16*)R6: the current field's start.
+    ldr r6, [sp, #24]                  // entry r6 = &u16 field byte-offset
+    ldrh r0, [r6]
+    ldr r7, [sp, #20]                  // entry r5 = the line base
+    add r7, r7, r0                     // r7 = the current field's start
+    // ---- "peek " / "poke " dispatch: ALL FIVE chars must match before we commit (a
+    // partial match falls to .pb_replay). The 2nd char picks the candidate word.
+    ldrb r0, [r7]
+    cmp r0, #'p'
+    bne .pb_replay
+    ldrb r1, [r7, #1]
+    cmp r1, #'e'
+    beq .pb_peek_tok
+    cmp r1, #'o'
+    beq .pb_poke_tok
+    b .pb_replay
+.pb_poke_tok:
+    ldrb r1, [r7, #2]
+    cmp r1, #'k'
+    bne .pb_replay
+    ldrb r1, [r7, #3]
+    cmp r1, #'e'
+    bne .pb_replay
+    ldrb r1, [r7, #4]
+    cmp r1, #' '
+    bne .pb_replay                     // not "poke " (no space) -> a normal line, replay the stock
+    bl pb_poke                         // "poke " confirmed: the parse + write live in cmd_poke.S
+    b pb_exit
+.pb_peek_tok:
+    ldrb r1, [r7, #2]
+    cmp r1, #'e'
+    bne .pb_replay
+    ldrb r1, [r7, #3]
+    cmp r1, #'k'
+    bne .pb_replay
+    ldrb r1, [r7, #4]
+    cmp r1, #' '
+    bne .pb_replay                     // not "peek " (no space) -> a normal line, replay the stock
+    bl pb_peek                         // "peek " confirmed: the parse + dump live in cmd_peek.S
+    b pb_exit
+    // ---- replay: byte-for-byte the original BL.W - same args, same target, same return point.
+    // Non-peek/poke lines replay the stock's own get_String8 so its normal handling is preserved.
+    // Runs with sp at the entry frame (branched to, not called: no bl frame to discard).
+.pb_replay:
+    pop {r0-r7, lr}                    // original args (r0-r3) + the caller's live r7, lr = 0x2A23
+    push {r7, lr}                      // r7 must not die in the ldr below; blx clobbers lr
+    ldr r7, =GET_STRING8_ADDR          // 0x451D (Thumb); indirect call, no ABS branch relocation
+    blx r7                             // get_String8; clobbers r0-r2/r5, preserves r3/r6/r7
+    pop {r7, lr}                       // r7 = 0x77F3B0, lr = 0x2A23 again
+    bx lr
+    .ltorg
+
+/* --------------------------------------------------------------------------
+ *  pb_exit: the success/exit terminal. Runs with sp at the entry frame (the entry's
+ *  push {r0-r7,lr}; no called function moves sp, since `bl` does not push a frame). Popping
+ *  the full 9-word frame restores lr = 0x2A23; r0 is then set to -1 (the stock's get_String8
+ *  not-found value) so the parser takes its stock unknown-command path (the 00
+ *  invalid-instruction reply follows our frame). */
+.thumb_func
+pb_exit:
+    pop {r0-r7, lr}
+    movs r0, #0
+    sub r0, r0, #1                     // r0 = -1
+    bx lr
+
+/* --------------------------------------------------------------------------
+ *  pb_exit_err: the error terminal: the 72 FF FF FF frame, then pb_exit. pk_marker clobbers
+ *  r0-r3 only; the entry frame (36 B) is intact under sp. */
+.thumb_func
+pb_exit_err:
+    movs r0, #0x72
+    bl pk_marker
+    movs r0, #0xFF
+    bl pk_marker
+    movs r0, #0xFF
+    bl pk_marker
+    movs r0, #0xFF
+    bl pk_marker
+    b pb_exit
+
+/* --------------------------------------------------------------------------
+ *  pb_window: the shared window check (peek: len bytes; poke: N bytes - the whole range
+ *  addr..addr+len must stay inside one window). No push of its own and NO sp adjustment:
+ *  `bl` does not push a frame, so sp is the caller's entry frame throughout and must be left
+ *  untouched for the terminal pop in pb_exit. In: r4=addr, r5=len. Out: r3 = 0 ok / 1 err.
+ *  Clobbers r1,r2 only. Ok: bx lr with r3=0; err: b pb_exit_err. */
+.thumb_func
+pb_window:
+    movs r2, #0x2000
+    lsl r2, r2, #4                     // r2 = 0x20000 (window 0 = the 0x0 SRAM0 alias end)
+    cmp r4, r2
+    blo .pw_ok
+    ldr r1, =PEEK_W1_LO
+    cmp r4, r1
+    blo .pw_err
+    ldr r2, =PEEK_W1_HI
+    cmp r4, r2
+    bhs .pw_w2
+    b .pw_ok
+.pw_w2:
+    ldr r1, =PEEK_W2_LO
+    cmp r4, r1
+    blo .pw_err
+    ldr r2, =PEEK_W2_HI
+    cmp r4, r2
+    bhs .pw_w3
+    b .pw_ok
+.pw_w3:
+    ldr r1, =PEEK_W3_LO
+    cmp r4, r1
+    blo .pw_err
+    ldr r2, =PEEK_W3_HI
+    cmp r4, r2
+    bhs .pw_w4
+    b .pw_ok
+.pw_w4:
+    ldr r1, =PEEK_W4_LO
+    cmp r4, r1
+    blo .pw_err
+    ldr r2, =PEEK_W4_HI
+    cmp r4, r2
+    bhs .pw_err
+    b .pw_ok                           // W4 (flash) needs the same jump to .pw_ok as W1-W3
+.pw_err:
+    b pb_exit_err
+.pw_ok:
+    add r1, r4, r5                     // addr + len must stay inside the window
+    cmp r1, r2
+    bhi .pw_err
+    movs r3, #0
+    bx lr
+    .ltorg
+
+/* --------------------------------------------------------------------------
+ *  pk_marker(r0 = byte): the relocated blob's own uart_putc. The blob cannot reuse the
+ *  in-image uart_putc/send_resp (the image at 0x80000 is clobbered by the stock boot), so
+ *  it re-derives the UART2 TX here: poll UART2_TH's TX FIFO fill level (the exact wait
+ *  uart_putc uses), then strb the byte to UART2_DR. All four address literals (UART2_TH/
+ *  MASK/FULL/DR) sit in THIS section's pool (PC-relative ldr) and stay valid after the
+ *  word copy because the whole block moves as one unit. This is the deterministic reach
+ *  signal: one 'Z' per 0x2A1E hit, independent of the backlight. Leaf: clobbers r0-r3. */
+.thumb_func
+pk_marker:
+    mov r3, r0                         // keep the byte out of r0-r2 while polling
+.pm_wait:
+    ldr r0, =UART2_TH
+    ldr r1, [r0]
+    ldr r2, =UART2_TXFIFO_MASK
+    ands r1, r1, r2
+    ldr r2, =UART2_TXFIFO_FULL
+    cmp r1, r2
+    bhs .pm_wait
+    ldr r0, =UART2_DR
+    strb r3, [r0]
+    bx lr
+    .ltorg
+
+.align 2
+/* pk_hex_table / pk_dec_table: for ASCII 0..127 the nibble/digit value, or 0xFF = not a
+ * digit (the parse loops' stop condition). In the blob (ADR-referenced) so the word-copy
+ * to PEEK_BLOB_DST keeps them coherent with the peek/poke parse loops. 128 bytes each. */
+pk_hex_table:
+    .rept 48
+    .byte 0xFF
+    .endr
+    .byte 0, 1, 2, 3, 4, 5, 6, 7, 8, 9        // '0'-'9'
+    .rept 7
+    .byte 0xFF
+    .endr
+    .byte 10, 11, 12, 13, 14, 15              // 'A'-'F'
+    .rept 26
+    .byte 0xFF
+    .endr
+    .byte 10, 11, 12, 13, 14, 15              // 'a'-'f'
+    .rept 25
+    .byte 0xFF
+    .endr
+pk_dec_table:
+    .rept 48
+    .byte 0xFF
+    .endr
+    .byte 0, 1, 2, 3, 4, 5, 6, 7, 8, 9        // '0'-'9'
+    .rept 70
+    .byte 0xFF
+    .endr
+
+/* The theme files: same section (.peekblob), same translation unit. Each holds only its
+ * theme's functions (no cross-references between them); the shared scaffolding above is
+ * what they call (pb_window/pb_exit/pb_exit_err/pk_marker/pk_hex_table). */
+.include "cmd_peek.S"
+.include "cmd_poke.S"
+    .align 2                  // end the section 4-aligned: the word copy at the stock
+                              // hand-off is word-granular, a partial tail word would
+                              // overwrite live stock data past the blob
+    .ltorg
+
+.text
