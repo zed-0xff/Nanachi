@@ -199,6 +199,16 @@
 .equ UART2_TC_VAL,       0x000F001A        // 115200 baud - this firmware's own literal value, see above
 .equ UART2_TXFIFO_MASK,  0x1F00            // UART2_TH bits [12:8]: TX FIFO fill level
 .equ UART2_TXFIFO_FULL,  0x1000            // uart_write_byte waits while fill level >= this
+.equ SEND_RESP_ADDR,     0x3F35            // send_resp(buf=r0, len=r1): the stock's ACTUAL reply TX - the comok
+                                           //   builder (sub_4114, string 0x4144) and every command reply route through
+                                           //   it. It checks g_send_locked (0 at our quiescent hook point, so the send
+                                           //   goes out) and calls g_uart1's (0x77F604) vtable pfun18: the real hardware
+                                           //   send on the physical UART the bench monitors in the stock pass. NOT UART2
+                                           //   (0x40006000, my cold-pass link): the stock re-muxes the serial link during
+                                           //   its own boot, so raw 0x40006000 and uart_write_byte writes never reach the
+                                           //   bench after handoff (both were benched silent). ODD = the Thumb-mode bit for
+                                           //   the indirect blx (same convention as GET_STRING8_ADDR 0x451D). Clobbers
+                                           //   r0-r3, preserves r4-r7/lr (AAPCS, as every stock reply path relies on).
 
 .equ ENCLK0_GPIO,     (1 << 1)             // GPIO block clock (probably already on, set again to be sure)
 .equ ENCLK0_VOUT,     (1 << 19)            // VOUT (panel timing controller) bus clock
@@ -575,6 +585,7 @@ entry:
     bl uart_puts
     bl install_entry_hook                    // see its own comment: the 2nd-melody hook, so we
                                               // regain control after every future ldr_exec (the stock pass)
+    bl install_peek_hook                        // 4-byte BLX.W over the stock parser 0x2A1E BL.W (see install_peek_hook)
     // ---- verify the patch we just wrote: read the 32 bytes back out of the loader's SRAM and
     // compare them byte-for-byte against patch_blob (the very source install_entry_hook copied).
     // A clean read-back proves the next ldr_exec_ (the stock pass) will detour through
@@ -604,8 +615,21 @@ entry:
     bne .pv_bad
     adds r7, r7, #4
     cmp r7, #8
-    beq .pv_ok
+    beq .pv_site3
     b .pv_site2_loop
+.pv_site3:
+    ldr r3, =PEEK_PATCH_SITE
+    ldr r6, =(patch_blob + 32)
+    movs r7, #0
+.pv_site3_loop:
+    ldr r0, [r6, r7]
+    ldr r1, [r3, r7]
+    cmp r0, r1
+    bne .pv_bad
+    adds r7, r7, #4
+    cmp r7, #4
+    beq .pv_ok
+    b .pv_site3_loop
 .pv_bad:
     ldr r0, =pv_bad_str
     bl uart_puts                             // uart_puts preserves r4 (pushes/pops it); r5-r7 untouched
@@ -617,6 +641,13 @@ entry:
     bl uart_puts
     ldr r0, [r5]
     movs r1, #0x71                          // 'q' = site2
+    ldr r2, =TEXT_BUF
+    bl hex_line
+    ldr r0, =TEXT_BUF
+    bl uart_puts
+    ldr r3, =PEEK_PATCH_SITE
+    ldr r0, [r3]
+    movs r1, #0x72                          // 'r' = site3 (coincidence: 0x72 is also the peek reply header)
     ldr r2, =TEXT_BUF
     bl hex_line
     ldr r0, =TEXT_BUF
@@ -1403,6 +1434,8 @@ uart_puts:
 .equ ICACHE_SR, 0xE0042104
 .equ CPU_CACHECTR, 0xE0042024
 
+.include "cmd_peek.S"
+
 /* --------------------------------------------------------------------------
  *  melody_play: self-contained TIM5 note player, shared by entry's 1st melody and
  *  entry_trampoline's 2nd
@@ -1503,6 +1536,64 @@ buzzer_rearm:
     str r2, [r1, #TIM_CCER]
     bx lr
 
+/* icache_reset: the vendor's only I-cache reset idiom (bypass-clear via CACHECTR, disable ->
+ * enable with the SR status wait, then restore the saved CCR/CACHECTR), extracted out of
+ * install_entry_hook so both callers share it: the cold pass (after the loader-site writes -
+ * those lines were already fetched during the 1st ldr_exec_, so without the reset every later
+ * ldr_exec_ re-fetches the cached originals and the trampoline is never entered) and the stock
+ * pass's install_peek_blob (defensive: 0x2A1E and the 0x79D448 blob are written into RAM that
+ * the stock will instruction-fetch, and this cache has no invalidate op - HAL_ICACHE_Invalid is
+ * a no-op). Clobbers r0-r3 only (dead at both call sites); the stores reach SRAM directly (the
+ * D-cache is write-through - HAL_DCACHE_Flush is a no-op). */
+.thumb_func
+icache_reset:
+    push {r4-r6, lr}
+    ldr r4, =ICACHE_CCR
+    ldr r5, =ICACHE_SR
+    ldr r6, =CPU_CACHECTR
+    ldr r0, [r6]                             // save CACHECTR (bypass bits)
+    ldr r1, [r4]                             // save CCR (enable bit)
+    bic r2, r0, #1                           // bypass off (as in HAL_ICACHE_Enable)
+    str r2, [r6]
+    movs r2, #0
+    str r2, [r4]                             // I-cache off
+    ldr r3, =0x40000
+.icr_off:
+    ldr r2, [r5]
+    ands r2, r2, #3
+    beq .icr_on                              // SR[1:0] == 0: disabled
+    subs r3, r3, #1
+    bne .icr_off
+.icr_on:
+    movs r2, #1
+    str r2, [r4]                             // I-cache on (refills from SRAM on next fetch)
+    ldr r3, =0x40000
+.icr_on2:
+    ldr r2, [r5]
+    ands r2, r2, #3
+    cmp r2, #2
+    beq .icr_restore                         // SR[1:0] == 2: enabled
+    subs r3, r3, #1
+    bne .icr_on2
+.icr_restore:
+    str r0, [r6]                             // restore CACHECTR
+    cmp r1, #1
+    beq .icr_done                            // was on: the toggle left it on - done
+    str r1, [r4]                             // was off: put it back off
+    ldr r3, =0x40000
+.icr_off3:
+    ldr r2, [r5]
+    ands r2, r2, #3
+    beq .icr_done
+    subs r3, r3, #1
+    bne .icr_off3
+.icr_done:
+    dsb
+    isb
+    pop {r4-r6, lr}
+    bx lr
+    .ltorg
+
 /* install_entry_hook: writes the 32-byte patch blob into the loader's SRAM - the 24-byte site1
  * window first, then the 8-byte site2 window (the blob is laid out in that order). Both sites are
  * only fetched again on later ldr_call/ldr_exec_ invocations, so writing them here (while the CPU
@@ -1528,63 +1619,21 @@ install_entry_hook:
     adds r1, r1, #4
     cmp r1, #8
     blo .ieh_site2
-    // ---- I-cache reset: the stores above reached SRAM (the D-cache is write-through - the
-    // vendor's HAL_DCACHE_Flush is a no-op), but the I-cache still holds the ORIGINAL site1/site2
-    // lines fetched during the 1st ldr_exec_. This cache has no invalidate op (HAL_ICACHE_Invalid
-    // is a no-op); the vendor's only reset idiom (HAL_ICACHE_Enable, used by reset.S) is
-    // bypass-clear then disable->enable with a status wait. Mirror it, then restore the saved
-    // CCR/CACHECTR so the stock firmware sees exactly the state the boot ROM left. Without this,
-    // every later ldr_exec_ re-fetches the cached originals and the trampoline is never entered.
-    ldr r4, =ICACHE_CCR
-    ldr r5, =ICACHE_SR
-    ldr r6, =CPU_CACHECTR
-    ldr r0, [r6]                             // save CACHECTR (bypass bits)
-    ldr r1, [r4]                             // save CCR (enable bit)
-    bic r2, r0, #1                           // bypass off (as in HAL_ICACHE_Enable)
-    str r2, [r6]
-    movs r2, #0
-    str r2, [r4]                             // I-cache off
-    ldr r3, =0x40000
-.ieh_ic_off:
-    ldr r2, [r5]
-    ands r2, r2, #3
-    beq .ieh_ic_on                           // SR[1:0] == 0: disabled
-    subs r3, r3, #1
-    bne .ieh_ic_off
-.ieh_ic_on:
-    movs r2, #1
-    str r2, [r4]                             // I-cache on (refills from SRAM on next fetch)
-    ldr r3, =0x40000
-.ieh_ic_on2:
-    ldr r2, [r5]
-    ands r2, r2, #3
-    cmp r2, #2
-    beq .ieh_ic_restore                      // SR[1:0] == 2: enabled
-    subs r3, r3, #1
-    bne .ieh_ic_on2
-.ieh_ic_restore:
-    str r0, [r6]                             // restore CACHECTR
-    cmp r1, #1
-    beq .ieh_ic_done                         // was on: the toggle left it on - done
-    str r1, [r4]                             // was off: put it back off
-    ldr r3, =0x40000
-.ieh_ic_off3:
-    ldr r2, [r5]
-    ands r2, r2, #3
-    beq .ieh_ic_done
-    subs r3, r3, #1
-    bne .ieh_ic_off3
-.ieh_ic_done:
-    dsb
-    isb
+    // ---- I-cache reset (see icache_reset): without it, every later ldr_exec_ re-fetches the
+    // cached original site1/site2 lines and the trampoline is never entered. r4-r6 are dead here.
+    bl icache_reset
     pop {r4-r6, pc}
 
+
+
 .align 2
-/* The 32-byte loader patch: site1 (24 B, assembled from stage1/patch1.S) then site2 (8 B, from
- * stage1/patch2.S). build.py's 2nd pass assembles both and splices the bytes in before packing;
- * the zeros here never ship. */
+/* The 36-byte patch blob: site1 (24 B, assembled from stage1/patch1.S), site2 (8 B, from
+ * stage1/patch2.S), and the 4-byte peek 32-bit BL (T1) (hand-encoded by build.py). build.py's
+ * 2nd pass builds all three and splices the bytes in before packing; the zeros here never ship. */
 patch_blob:
     .space 32
+peek_patch_word:
+    .space 4
 
 /* entry_trampoline: what ldr_exec_'s patched blx (site2) jumps into instead of the reset-vector
  * word it would normally load. No registers are passed: set_msp already replaced MSP with the target
@@ -1669,7 +1718,35 @@ entry_trampoline:
     ldr r0, =LDR_EXEC_FRAME
     ldr r0, [r0]                             // reload a1 (iwdg_feed clobbers r0)
     cmp r0, #0
-    bne .tm_sd_exit
+    bne .tm_sd_exit                          // a1 != 0: the SD pass - fall to .tm_sd_exit
+    // ---- stock pass: land the peek blob in the safe gap, reinstall the patch, self-check, jump.
+    // ldr_main's stock path (sub_200013D8 + sub_20001554) just copied the WHOLE stock firmware from
+    // the flash window (0x10000000) into RAM 0x0, overwriting the 0x2A1E word the cold pass wrote,
+    // and the stock boot (reset 0x348 -> init_table_runner 0x270) that follows clobbers the image
+    // itself (0x080000..~0x077F3B0) - so the blob must leave the image before the jump.
+    // install_peek_blob copies it to PEEK_BLOB_DST (0x79D448, the safe gap), re-writes the 0x2A1E
+    // BL targeting the copy, and resets the I-cache; nothing else is touched before the jump.
+    bl install_peek_blob
+    ldr r1, =PEEK_PATCH_SITE
+    ldr r0, [r1]                             // the word just written: our BL word if the patch
+                                               // landed, the stock's original BL.W if not
+    movs r1, #0x50                           // 'P'
+    ldr r2, =TEXT_BUF
+    bl hex_line
+    ldr r0, =TEXT_BUF
+    bl uart_puts                             // "P:XXXXXXXX" at the stock hand-off: build marker (older
+                                               // images print no P: line) + patch self-check
+                                               // (P:FD7DF001 = original BL.W still there = install failed)
+    ldr r3, =PEEK_BLOB_DST
+    ldr r0, [r3]                             // the gap copy's first word: build marker (0 = the copy
+                                               // never landed)
+    movs r1, #0x52                           // 'R'
+    ldr r2, =TEXT_BUF
+    bl hex_line
+    ldr r0, =TEXT_BUF
+    bl uart_puts                             // "R:XXXXXXXX": an intact copy prints B4F0 (the
+                                               // peekblob_entry PUSH{r4-r7,lr})
+    ldr r0, =LDR_LAST_DST
     ldr r0, =LDR_LAST_DST
     ldr r0, [r0]                             // r0 = ldr_last_dst = [a1+4] (ldr_exec_'s 1de6/1dea copy)
     blx r0                                   // one-way into the stock app (it never returns)
@@ -1679,6 +1756,8 @@ entry_trampoline:
     pop {r4-r8, lr}                          // restore ldr_call's 24-byte frame
     bx lr                                    // -> ldr_main (0x2fde after the one-off, 0x302e in the slot loop)
     .ltorg
+
+.text
 
 /* fault_trap: the HardFault handler (vector slot 3). On entry the HW has already pushed the
  * exception frame (R0-R3, R12, LR, PC, xPSR at [sp..sp+28]) onto the faulting stack, so r13 sits 32

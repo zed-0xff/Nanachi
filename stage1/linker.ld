@@ -43,6 +43,17 @@ SECTIONS
         _image_end = .;
     }
 
+    /* The relocated peek blob (v2j): linked in the image like everything else, but at the stock
+     * hand-off install_peek_blob copies this one section (its LMA range __peekblob_lma..
+     * __peekblob_end) to 0x79D448 - the safe gap that survives the stock boot, since the stock
+     * clobbers the image itself (0x080000..~0x077F3B0). The 0x2A1E BL targets the copy. It must
+     * stay a single contiguous 4-byte-aligned block (see stage1.S's .peekblob comment). */
+    .peekblob : {
+        __peekblob_lma = .;
+        *(.peekblob)
+        __peekblob_end = .;
+    }
+
     .data : {
         _data_start = .;
         *(.data)

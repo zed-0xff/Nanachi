@@ -9,6 +9,7 @@ Answers the questions that decide whether KlipperScreen can run on the stock scr
   soft-reset  the screen is silent at the right baud rate (stuck mid-command): send the standard upload-library reset sequence
   recover     the screen is silent after a baud change: soft-reset, then send baud=115200 at every rate
   raw     send any command, print every reply
+  peek    read panel memory as a hex dump (the stage1 image's `peek` command - needs that image running)
   bench   draw command throughput at 115200 and (--fast 921600) at a higher baud rate
   flash   write a .tft with `whmi-wri` (what Sovol's `uart` does), only after the .tft checksums verified
 
@@ -18,6 +19,7 @@ Examples:
   screen_probe.py --port /dev/ttyS4 touch --seconds 20
   screen_probe.py --port /dev/ttyS4 upload tile.jpg --repeat 5
   screen_probe.py --port /dev/ttyS4 raw 'page 1'
+  screen_probe.py --port /dev/ttyS4 peek 0xE0010000 256
 """
 import argparse
 import os
@@ -186,6 +188,86 @@ def cmd_raw(a):
     s = Screen(a.port, a.baud or 115200, a.verbose)
     for cmd in a.commands:
         print(cmd, "->", [parse_frame(f) for f in s.ask(cmd, a.wait)] or "no reply")
+
+
+def _peek_parse(raw: bytes):
+    """Splits a peek reply into (dump data, error message or None, beacon count, junk). The stage1
+    blob answers a `peek` line with a 0x5A beacon, then dump frames 72 <n> <n data bytes> FF FF FF
+    (n <= 255; every full chunk is n = 0xFF), or the error frame 72 + FF FF FF, then the stock's own
+    00 invalid-instruction ack. Short chunks (n != 0xFF) consume their data by length, so they are
+    unambiguous even when the data holds 0x72/0x00/0xFF. A 0xFF length is ambiguous with the error
+    frame (both start 72 FF), so it is resolved by lookahead: a real 255-byte chunk carries its
+    terminator exactly 255 data bytes out, while the error frame is only 4 bytes long."""
+    beacons, chunks, err, junk, i, n = 0, [], None, bytearray(), 0, len(raw)
+    while i < n:
+        b = raw[i]
+        if b == 0x5a:
+            beacons += 1
+            i += 1
+        elif b == 0x72 and i + 1 < n and raw[i + 1] != 0xff:
+            ln = raw[i + 1]
+            j = i + 2 + ln
+            if j + 3 <= n and raw[j:j + 3] == END:
+                chunks.append(raw[i + 2:j])
+                i = j + 3
+            else:
+                junk += raw[i:]
+                break
+        elif b == 0x72:
+            if i + 260 <= n and raw[i + 257:i + 260] == END:   # 255-byte chunk: terminator 255 out
+                chunks.append(raw[i + 2:i + 257])
+                i += 260
+            elif i + 4 <= n and raw[i + 1:i + 4] == END:       # the 4-byte error frame
+                err = "error frame (bad syntax or outside the readable windows)"
+                i += 4
+            else:
+                junk += raw[i:]
+                break
+        elif raw[i:i + 3] == END:
+            i += 3
+        else:
+            junk += bytes([b])          # the stock's 00 ack and anything else
+            i += 1
+    return b"".join(chunks), err, beacons, bytes(junk)
+
+
+def _hexdump(base: int, data: bytes):
+    for off in range(0, len(data), 16):
+        row = data[off:off + 16]
+        hexpart = " ".join(f"{b:02x}" for b in row).ljust(47)
+        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+        print(f"{base + off:08x}  {hexpart}  |{asc}|")
+
+
+def cmd_peek(a):
+    s = Screen(a.port, a.baud or 115200, a.verbose)
+    cmd = f"peek 0x{a.addr:x},{a.length}"
+    s.ser.reset_input_buffer()
+    s.buf = b""
+    s.send(cmd)
+    # A 16 KB dump (the blob's max) takes ~1.5 s at 115200; read until a 0.3 s quiet period or --wait.
+    raw, last = b"", time.time()
+    end = time.time() + a.wait
+    while time.time() < end:
+        c = s.ser.read(256)
+        if c:
+            raw += c
+            last = time.time()
+        elif raw and time.time() - last > 0.3:
+            break
+    dump, err, beacons, junk = _peek_parse(raw)
+    if beacons:
+        print(f"  (0x5A beacon x{beacons}: the peek blob ran)")
+    if err:
+        print(f"peek {cmd}: {err}")
+    if dump:
+        _hexdump(a.addr, dump)
+        print(f"  {len(dump)} bytes from 0x{a.addr:08x}")
+    if not dump and not err:
+        print(f"peek {cmd}: no dump frame (is the stage1 image with the peek blob running?)")
+    junk = bytes(b for b in junk if b != 0x00)      # the 00 invalid-instruction ack is expected after a peek
+    if junk:
+        print(f"  (unparsed tail: {junk.hex(' ')})")
 
 
 def read_acks(ser, timeout, seen=None):
@@ -487,6 +569,11 @@ def main():
     r.add_argument("commands", nargs="+")
     r.add_argument("--wait", type=float, default=0.5)
     r.set_defaults(fn=cmd_raw)
+    k = sub.add_parser("peek", help="read panel memory as a hex dump (needs the stage1 image's peek blob running)")
+    k.add_argument("addr", type=lambda s: int(s, 0), help="start address (0x hex or decimal)")
+    k.add_argument("length", type=lambda s: int(s, 0), help="bytes to dump (must be < 0x4000 and inside one readable window)")
+    k.add_argument("--wait", type=float, default=3.0, help="max seconds to wait for the dump (a 0.3 s quiet period ends it early)")
+    k.set_defaults(fn=cmd_peek)
     u = sub.add_parser("upload")
     u.add_argument("file")
     u.add_argument("--target", default="ram/probe.jpg")
