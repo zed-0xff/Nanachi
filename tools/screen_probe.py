@@ -1005,7 +1005,8 @@ def cmd_flash(a):
         if read_acks(s.ser, 5.0) != 0x05:
             print(f"no ack after {pos + chunk} bytes")
             return 1
-        print(f"\r{min(pos + chunk, len(data)) * 100 // len(data)}%", end="", flush=True)
+        pct = min(pos + chunk, len(data)) * 100 // len(data)
+        print(f"\r[{'#' * (30 * pct // 100):<30}] {pct:3d}%", end="", flush=True)
     print("\ndone; give the screen a few seconds to apply the update")
 
 
