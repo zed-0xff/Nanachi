@@ -10,6 +10,7 @@ Answers the questions that decide whether KlipperScreen can run on the stock scr
   recover     the screen is silent after a baud change: soft-reset, then send baud=115200 at every rate
   raw     send any command, print every reply
   peek    read panel memory as a hex dump (the stage1 image's `peek` command - needs that image running)
+  shell   one console open, then a peek/poke/raw REPL on the same link (the slow comok is paid once, not per command)
   bench   draw command throughput at 115200 and (--fast 921600) at a higher baud rate
   flash   write a .tft with `whmi-wri` (what Sovol's `uart` does), only after the .tft checksums verified
 
@@ -20,12 +21,18 @@ Examples:
   screen_probe.py --port /dev/ttyS4 upload tile.jpg --repeat 5
   screen_probe.py --port /dev/ttyS4 raw 'page 1'
   screen_probe.py --port /dev/ttyS4 peek 0xE0010000 256
+  screen_probe.py --port /dev/ttyS4 shell      (peek/poke/raw REPL on one open console)
 """
 import argparse
 import os
 import struct
 import sys
 import time
+
+try:
+    from .iac import IacSerial          # imported as tools.screen_probe
+except ImportError:
+    from iac import IacSerial           # run as python3 tools/screen_probe.py
 
 BAUDS = [115200, 921600, 230400, 460800, 57600, 38400, 19200, 9600, 4800, 2400]
 END = b"\xff\xff\xff"
@@ -89,12 +96,25 @@ def parse_frame(f: bytes) -> str:
 
 
 class Screen:
-    def __init__(self, port, baud, verbose=False):
+    def __init__(self, port, baud, verbose=False, iac=False):
         import serial
-        self.ser = serial.serial_for_url(port, baudrate=baud, timeout=0.05) if "://" in port \
+        ser = serial.serial_for_url(port, baudrate=baud, timeout=0.05) if "://" in port \
             else serial.Serial(port, baud, timeout=0.05)
+        # IacSerial is a transparent pass-through unless --iac: then it escapes 0xFF on the wire
+        # (ser2net in telnet mode doubles it) and un-escapes on read, so every ser.read/write below works unchanged.
+        self.ser = IacSerial(ser, iac)
         self.verbose = verbose
         self.buf = b""
+        if iac:
+            # In telnet mode ser2net emits a negotiation burst right after TCP
+            # connect. Answer it (accept every option) so ser2net stops waiting
+            # and starts forwarding: without a reply it holds our data for its
+            # ~3 s negotiation timeout, which was the entire console-open
+            # latency; with one the first reply lands in ~10 ms.
+            t0 = time.time()
+            self.ser.handshake()
+            if self.verbose:
+                print(f"  (iac handshake: {time.time() - t0:.2f}s)")
         # The first command after opening a port is often garbled (a USB serial bridge may drop or add bytes while the host
         # side settles; the screen then answers 0x1A "invalid variable" to it): send an empty command and drop the answer.
         time.sleep(0.2)
@@ -130,12 +150,51 @@ class Screen:
         self.send(cmd)
         return self.frames(seconds)
 
+    def connect(self, cap=6.0, resend=1.5):
+        """Patient ``connect`` as ONE continuous read loop.
+
+        Sends ``connect``, then reads without stopping until the panel's ``comok``
+        arrives or ``cap`` seconds elapse, resending ``connect`` every ``resend``
+        seconds while waiting. The buffer is never reset between resends, so a
+        ``comok`` that lands between two sends is picked up on the very next read
+        instead of being discarded and re-requested -- the old fixed read-windows
+        could miss a ``comok`` that arrived just after a window closed, and that
+        lost window was the bulk of a slow peek. The panel opens the console on
+        its own schedule (~3.5-5 s over the ACM/ser2net path, independent of our
+        resend cadence), so that latency is the floor here, not our polling.
+        Returns the ``comok`` frame, or every frame that arrived if none."""
+        t0 = time.time()
+        self.ser.reset_input_buffer()
+        self.buf = b""
+        out = []
+        self.send("connect")
+        next_send = t0 + resend
+        while time.time() - t0 < cap:
+            chunk = self.ser.read(256)
+            if chunk:
+                self.buf += chunk
+                while END in self.buf:
+                    f, self.buf = self.buf.split(END, 1)
+                    out.append(f)
+                    if f.startswith(b"comok"):
+                        if self.verbose:
+                            print(f"  (comok in {time.time() - t0:.2f}s)")
+                        self.buf = b""
+                        return [f]
+            if time.time() >= next_send:
+                if self.verbose:
+                    print(f"  (connect resend at {time.time() - t0:.2f}s)")
+                self.send("connect")
+                next_send = time.time() + resend
+        if self.verbose:
+            print(f"  (connect: no comok after {time.time() - t0:.2f}s)")
+        return out
+
 
 def cmd_scan(a):
     for baud in ([a.baud] if a.baud else BAUDS):
-        s = Screen(a.port, baud, a.verbose)
-        s.ser.write(END)
-        got = s.ask("connect", 0.6)
+        s = Screen(a.port, baud, a.verbose, a.iac)
+        got = s.connect()
         s.close()
         print(f"{baud:>7}: " + ("; ".join(parse_frame(f) for f in got) if got else "no answer"))
         if any(f.startswith(b"comok") for f in got):
@@ -149,7 +208,7 @@ def cmd_scan(a):
 
 
 def cmd_touch(a):
-    s = Screen(a.port, a.baud or 115200, a.verbose)
+    s = Screen(a.port, a.baud or 115200, a.verbose, a.iac)
     for c in ("bkcmd=3", "sendxy=1"):
         print(c, "->", [parse_frame(f) for f in s.ask(c)])
     print(f"touch the screen for {a.seconds} s (Ctrl-C to stop)")
@@ -166,7 +225,7 @@ def cmd_touch(a):
 
 
 def cmd_draw(a):
-    s = Screen(a.port, a.baud or 115200, a.verbose)
+    s = Screen(a.port, a.baud or 115200, a.verbose, a.iac)
     s.ask("bkcmd=3")
     tests = [
         ("fill 0,0,480,272,BLACK", "fill whole screen"),
@@ -185,7 +244,7 @@ def cmd_draw(a):
 
 
 def cmd_raw(a):
-    s = Screen(a.port, a.baud or 115200, a.verbose)
+    s = Screen(a.port, a.baud or 115200, a.verbose, a.iac)
     for cmd in a.commands:
         print(cmd, "->", [parse_frame(f) for f in s.ask(cmd, a.wait)] or "no reply")
 
@@ -239,63 +298,135 @@ def _hexdump(base: int, data: bytes):
         print(f"{base + off:08x}  {hexpart}  |{asc}|")
 
 
-def cmd_peek(a):
-    s = Screen(a.port, a.baud or 115200, a.verbose)
-    cmd = f"peek 0x{a.addr:x},{a.length}"
+def _quiet_drain(s, seconds):
+    """Discard inbound bytes until a short quiet period or the cap, to clear a
+    throwaway line's reply before the next command starts."""
+    last = time.time()
+    end = time.time() + seconds
+    while time.time() < end:
+        if s.ser.read(256):
+            last = time.time()
+        elif time.time() - last > 0.2:
+            break
+
+
+def _open_console(s):
+    """Open the console on a fresh link. The panel parses probe lines only while the
+    console is open (the printer app otherwise owns the port): True if a comok came back.
+
+    After comok the stock parser only reaches the 0x2A1E (get_String8) hook that the
+    peek/poke blob rides on from the SECOND line onward, so the very first line is
+    consumed as a 0x1A without hitting the blob. We send one throwaway priming line
+    and drain it; every real command after that reliably reaches the blob."""
+    got = s.connect()
+    if not any(f.startswith(b"comok") for f in got):
+        return False
     s.ser.reset_input_buffer()
     s.buf = b""
-    s.send(cmd)
-    # A 16 KB dump (the blob's max) takes ~1.5 s at 115200; read until a 0.3 s quiet period or --wait.
+    s.send("get dp")          # the priming line (read-only; its 0x1A/number reply is discarded)
+    _quiet_drain(s, 0.5)
+    s.ser.reset_input_buffer()
+    s.buf = b""
+    return True
+
+
+def _peek_read(s, expected, wait):
+    """Read one peek reply, stopping deterministically as soon as ``expected`` dump
+    bytes are collected (the blob's dump is exactly ``expected`` bytes) or an error
+    frame arrives; a 0.3 s quiet period and the ``wait`` backstop cover the cases
+    where the panel sends less than expected or the link never goes quiet.
+    Returns ``(dump, err, beacons, junk, raw)``."""
     raw, last = b"", time.time()
-    end = time.time() + a.wait
+    s.ser.timeout = 0.01          # tight poll: a short reply is noticed within ~10 ms, not the 50 ms default
+    end = time.time() + wait
     while time.time() < end:
         c = s.ser.read(256)
         if c:
             raw += c
             last = time.time()
+            dump, err, _, _ = _peek_parse(raw)
+            if err or len(dump) >= expected:
+                break
         elif raw and time.time() - last > 0.3:
             break
     dump, err, beacons, junk = _peek_parse(raw)
+    return dump, err, beacons, junk, raw
+
+
+def _peek_run(s, addr, length, wait, verbose=False):
+    """Run one peek against an already-open console and print the result."""
+    cmd = f"peek 0x{addr:x},{length}"
+    s.ser.reset_input_buffer()          # clear any trailing bytes from a previous command's deterministic stop
+    s.send(cmd)
+    dump, err, beacons, junk, raw = _peek_read(s, length, wait)
     if beacons:
         print(f"  (0x5A beacon x{beacons}: the peek blob ran)")
     if err:
         print(f"peek {cmd}: {err}")
     if dump:
-        _hexdump(a.addr, dump)
-        print(f"  {len(dump)} bytes from 0x{a.addr:08x}")
+        _hexdump(addr, dump)
+        print(f"  {len(dump)} bytes from 0x{addr:08x}")
     if not dump and not err:
-        print(f"peek {cmd}: no dump frame (is the stage1 image with the peek blob running?)")
+        # A reply with no Z beacon means the stock parser answered (0x1A invalid-variable) -
+        # the blob is not installed on this boot. A Z beacon with no data means the blob ran
+        # but the window/syntax was bad. 0 bytes means the line was dropped (console not open).
+        if raw and 0x5a not in raw:
+            print(f"peek {cmd}: no Z beacon - the peek blob is not installed on this boot (stock answered)")
+        elif raw:
+            print(f"peek {cmd}: Z beacon but no dump (bad window or syntax?)")
+        else:
+            print(f"peek {cmd}: nothing received (the console dropped the line)")
+        print(f"  (raw: {len(raw)} bytes: {raw[:64].hex(' ')})" if raw else "  (raw: nothing received)")
+        if not raw:
+            # the line was never answered: probe with a known 3-char line that the 0x2A1E path
+            # handles in stock and in the blob; a Z beacon in the reply means the blob is installed
+            s.send("get dp")
+            p, last = b"", time.time()
+            pend = time.time() + 1.5
+            while time.time() < pend:
+                c = s.ser.read(256)
+                if c:
+                    p += c
+                    last = time.time()
+                elif p and time.time() - last > 0.3:
+                    break
+            if p:
+                print(f"  (probe 'get dp': {len(p)} bytes, {'blob (Z beacon)' if 0x5a in p else 'no Z (stock)'}, head {p[:24].hex(' ')})")
+            else:
+                print("  (probe 'get dp': silence — the console dropped the line)")
     junk = bytes(b for b in junk if b != 0x00)      # the 00 invalid-instruction ack is expected after a peek
     if junk:
         print(f"  (unparsed tail: {junk.hex(' ')})")
 
 
-def cmd_poke(a):
-    s = Screen(a.port, a.baud or 115200, a.verbose)
-    data = a.data
-    if data[:2].lower() == "0x":
-        data = data[2:]
-    if not data or len(data) % 2 or len(data) > 2 * 255:
-        print(f"poke: data must be 1-255 bytes of hex (2 digits per byte, no 0x/spaces); refusing")
+def cmd_peek(a):
+    s = Screen(a.port, a.baud or 115200, a.verbose, a.iac)
+    if not _open_console(s):
+        print("peek: no comok (the console did not open; another client holds the panel, or it is mid-boot)")
         return
-    if not all(c in "0123456789abcdefABCDEF" for c in data):
-        print(f"poke: data must be hex digits only; refusing")
-        return
-    value = bytes.fromhex(data)
-    # The blob answers a success with NO frame (the Z beacon only) - the write happened;
-    # an error (bad syntax / N > 255 / outside the writable windows) is one 72 FF FF FF
-    # frame. _peek_parse splits both: a success is beacons with zero chunks.
-    cmd = f"poke 0x{a.addr:x},{len(value)},{data.upper()}"
-    s.ser.reset_input_buffer()
-    s.buf = b""
+    _peek_run(s, a.addr, a.length, a.wait, a.verbose)
+    s.close()
+
+
+def _poke_run(s, addr, value, wait, verify, verbose=False):
+    """Run one poke against an already-open console and print the result. ``value`` is
+    the bytes to write. The blob answers a success with NO frame (the Z beacon only) -
+    the write happened; an error (bad syntax / N > 255 / outside the writable windows)
+    is one 72 FF FF FF frame. _peek_parse splits both: a success is beacons with zero
+    chunks. The read stops on the error frame (no need to wait the quiet period)."""
+    cmd = f"poke 0x{addr:x},{len(value)},{value.hex().upper()}"
+    s.ser.reset_input_buffer()          # clear any trailing bytes from a previous command
     s.send(cmd)
     raw, last = b"", time.time()
-    end = time.time() + a.wait
+    s.ser.timeout = 0.01               # tight poll: the Z-beacon / error reply is noticed within ~10 ms
+    end = time.time() + wait
     while time.time() < end:
         c = s.ser.read(256)
         if c:
             raw += c
             last = time.time()
+            if _peek_parse(raw)[1]:          # the 72 FF FF FF error frame is already whole
+                break
         elif raw and time.time() - last > 0.3:
             break
     dump, err, beacons, junk = _peek_parse(raw)
@@ -304,26 +435,15 @@ def cmd_poke(a):
     if err:
         print(f"poke {cmd}: {err}")
     elif beacons and not dump:
-        print(f"poke {cmd}: ok ({len(value)} bytes to 0x{a.addr:08x}; no reply frame - the write is not echoed)")
-        if a.verify:
-            s.buf = b""
-            v = f"peek 0x{a.addr:x},{len(value)}"
-            s.send(v)
-            raw, last = b"", time.time()
-            vend = time.time() + a.wait
-            while time.time() < vend:
-                c = s.ser.read(256)
-                if c:
-                    raw += c
-                    last = time.time()
-                elif raw and time.time() - last > 0.3:
-                    break
-            vd, verr, vbeacons, _ = _peek_parse(raw)
+        print(f"poke {cmd}: ok ({len(value)} bytes to 0x{addr:08x}; no reply frame - the write is not echoed)")
+        if verify:
+            s.ser.reset_input_buffer()       # the poke read may have stopped on the quiet period with a partial ack left
+            vd, _, _, _, _ = _peek_read(s, addr, len(value), wait)
             if vd == value:
                 print(f"  verify: peek matches the written data")
             else:
                 print(f"  verify: peek differs (wrote {value.hex(' ')}, read {vd.hex(' ') if vd else 'NO DATA'}"
-                      f"{' - the window is read-only (store dropped)' if vd else ''})")
+                      f"{' - the window is read-only (store dropped)' if not vd else ''})")
     elif not dump:
         print(f"poke {cmd}: no beacon (is the stage1 image with the poke blob running?)")
     else:
@@ -331,6 +451,102 @@ def cmd_poke(a):
     junk = bytes(b for b in junk if b != 0x00)      # the 00 invalid-instruction ack is expected after a poke
     if junk:
         print(f"  (unparsed tail: {junk.hex(' ')})")
+
+
+def _parse_poke_data(data):
+    """Validate a hex string (optional 0x prefix, 1-255 bytes) to bytes, or return None."""
+    if data[:2].lower() == "0x":
+        data = data[2:]
+    if not data or len(data) % 2 or len(data) > 2 * 255:
+        return None
+    if not all(c in "0123456789abcdefABCDEF" for c in data):
+        return None
+    return bytes.fromhex(data)
+
+
+def cmd_poke(a):
+    s = Screen(a.port, a.baud or 115200, a.verbose, a.iac)
+    value = _parse_poke_data(a.data)
+    if value is None:
+        print("poke: data must be 1-255 bytes of hex (2 digits per byte, no spaces; an optional 0x prefix is fine); refusing")
+        return
+    if not _open_console(s):
+        print("poke: no comok (the console did not open; another client holds the panel, or it is mid-boot)")
+        return
+    _poke_run(s, a.addr, value, a.wait, a.verify, a.verbose)
+    s.close()
+
+
+def cmd_shell(a):
+    """One console open, then a peek/poke/raw REPL on the same link.
+
+    The ~3.5-5 s ``comok`` (the panel opening the console on its own schedule)
+    is paid once, at open; every command after that costs only the wire time of
+    its reply (tens to a hundred ms at this link), not another console open.
+    Commands: ``peek ADDR [LEN]`` (LEN default 256), ``poke ADDR HEX``,
+    ``raw CMD...``, ``quit``."""
+    s = Screen(a.port, a.baud or 115200, a.verbose, a.iac)
+    if not _open_console(s):
+        print("shell: no comok (the console did not open; another client holds the panel, or it is mid-boot)")
+        return 1
+    print("console open. peek ADDR [LEN] | poke ADDR HEX | raw CMD... | quit")
+    while True:
+        try:
+            line = input("nanachi> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+        word, _, arg = line.partition(" ")
+        word, arg = word.lower(), arg.strip()
+        if word in ("quit", "exit"):
+            break
+        t0 = time.time()
+        try:
+            if word == "peek":
+                toks = arg.split()
+                addr = int(toks[0], 0) if toks else 0
+                length = int(toks[1], 0) if len(toks) > 1 else 256
+                _peek_run(s, addr, length, a.wait, a.verbose)
+            elif word == "poke":
+                toks = arg.split()
+                if len(toks) < 2:
+                    print("usage: poke ADDR HEX")
+                else:
+                    addr = int(toks[0], 0)
+                    value = _parse_poke_data(toks[1])
+                    if value is None:
+                        print("poke: data must be 1-255 bytes of hex (2 digits per byte)")
+                    else:
+                        _poke_run(s, addr, value, a.wait, False, a.verbose)
+            elif word == "raw":
+                s.ser.reset_input_buffer()
+                s.buf = b""
+                s.send(arg)
+                rawb, last = b"", time.time()
+                rend = time.time() + a.wait
+                while time.time() < rend:
+                    c = s.ser.read(256)
+                    if c:
+                        rawb += c
+                        last = time.time()
+                    elif rawb and time.time() - last > 0.3:
+                        break
+                frames = []
+                while END in rawb:
+                    f, rawb = rawb.split(END, 1)
+                    frames.append(f)
+                print([parse_frame(f) for f in frames] or "no reply")
+            else:
+                print(f"unknown '{word}' (peek ADDR [LEN] | poke ADDR HEX | raw CMD | quit)")
+        except ValueError:
+            print("bad number (addr / len)")
+        if a.verbose:
+            print(f"  ({time.time() - t0:.3f}s)")
+    s.close()
+    print("closed")
+    return 0
 
 
 def read_acks(ser, timeout, seen=None):
@@ -353,7 +569,7 @@ def cmd_upload(a):
     if not _baud_guard(a):
         return 2
     data = open(a.file, "rb").read()
-    s = Screen(a.port, a.baud or 115200, a.verbose)
+    s = Screen(a.port, a.baud or 115200, a.verbose, a.iac)
     for cmd in ([f"bkcmd={a.bkcmd}"] if a.bkcmd is not None else []) + (["tsw 255,0"] if a.no_touch else []):
         print(cmd, "->", [parse_frame(f) for f in s.ask(cmd)])
     if a.delete:
@@ -494,7 +710,7 @@ def _restore_baud(s, old):
 
 def cmd_soft_reset(a):
     """Standalone `_soft_reset`: fixes a screen stuck mid-command without touching the baud rate."""
-    s = Screen(a.port, a.baud or 115200, a.verbose)
+    s = Screen(a.port, a.baud or 115200, a.verbose, a.iac)
     ok = _soft_reset(s)
     s.close()
     print("screen answers" if ok else "no answer; try `recover` (wrong baud rate) or power cycle the screen")
@@ -505,14 +721,14 @@ def cmd_recover(a):
     """The screen may be stuck mid-command (fixed by `_soft_reset`, tried first here) or sit at another baud rate than
     the host after a failed `baud` change (send `baud=115200` at every rate and look for the screen at 115200)."""
     target = a.baud or 115200
-    s = Screen(a.port, target, a.verbose)
+    s = Screen(a.port, target, a.verbose, a.iac)
     if _soft_reset(s):
         s.close()
         print(f"screen answers at {target} baud after a soft reset")
         return 0
     s.close()
     for rate in BAUDS:
-        s = Screen(a.port, rate, a.verbose)
+        s = Screen(a.port, rate, a.verbose, a.iac)
         for _ in range(2):
             s.ser.write(END + f"baud={target}".encode() + END)
             s.ser.flush()
@@ -560,7 +776,7 @@ def cmd_bench(a):
     the screen is back at 115200 after a power cycle; the probe tries to switch back itself)."""
     if not _baud_guard(a):
         return 2
-    s = Screen(a.port, a.baud or 115200, a.verbose)
+    s = Screen(a.port, a.baud or 115200, a.verbose, a.iac)
     s.ask("bkcmd=0")
     dt = _timed_fills(s, a.count)
     print(f"{s.ser.baudrate} baud: {a.count} fill commands in {dt:.2f} s = {a.count / dt:.0f} commands/s")
@@ -591,7 +807,7 @@ def cmd_flash(a):
         print("dry run; add --yes-flash to really write it")
         return 0
     chunk = 4096
-    s = Screen(a.port, a.start_baud, a.verbose)
+    s = Screen(a.port, a.start_baud, a.verbose, a.iac)
     if a.start_baud != a.flash_baud:
         # Change the rate first, with a handshake: bytes sent right after the host side changed its baud rate through a USB
         # serial bridge are unreliable, so the first 4096 byte block of the transfer would be short and never acknowledged.
@@ -620,6 +836,8 @@ def main():
     p.add_argument("--port", required=True, help="serial device, e.g. /dev/ttyS4 (or a pyserial url)")
     p.add_argument("--baud", type=int, help="baud rate (default 115200; scan tries all when omitted)")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--iac", action="store_true",
+                   help="the ser2net/telnet link escapes 0xFF (IAC): double it on send, un-double on receive (default off = raw)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("scan").set_defaults(fn=cmd_scan)
     t = sub.add_parser("touch")
@@ -643,6 +861,9 @@ def main():
     pk.add_argument("--verify", action="store_true", help="after a successful poke, peek the range back and compare")
     pk.add_argument("--wait", type=float, default=3.0, help="max seconds to wait for the readback (a 0.3 s quiet period ends it early)")
     pk.set_defaults(fn=cmd_poke)
+    sh = sub.add_parser("shell", help="one console open, then a peek/poke/raw REPL on the same link (the 3.5-5 s comok is paid once)")
+    sh.add_argument("--wait", type=float, default=3.0, help="max seconds per command (a 0.3 s quiet period ends it early)")
+    sh.set_defaults(fn=cmd_shell)
     u = sub.add_parser("upload")
     u.add_argument("file")
     u.add_argument("--target", default="ram/probe.jpg")
