@@ -37,7 +37,7 @@ try:
 except ImportError:
     from iac import IacSerial           # run as python3 tools/screen_probe.py
 
-BAUDS = [115200, 921600, 230400, 460800, 57600, 38400, 19200, 9600, 4800, 2400]
+BAUDS = [115200, 921600, 9600, 230400, 460800, 57600, 38400, 19200, 4800, 2400]
 END = b"\xff\xff\xff"
 POKE_MAX = 255          # the stage1 blob's poke N cap; file pokes chunk to this
 
@@ -931,12 +931,25 @@ def cmd_bench(a):
         _restore_baud(s, old)
 
 
-def cmd_flash(a):
+# try to find TFTTool upto two levels up from this script, and import it to verify the checksums of the file to flash
+def _find_tfttool():
     here = os.path.dirname(os.path.abspath(__file__))
-    # TFTTool is the sibling library at the workspace root (<root>/TFTTool/),
-    # i.e. three levels up from this file (tools/ -> Nanachi/ -> root -> TFTTool).
-    sys.path.insert(0, os.path.abspath(os.path.join(here, "..", "..", "..", "TFTTool")))
-    import TFTTool
+    for i in range(3):
+        candidate = os.path.abspath(os.path.join(here, *[".."] * i, "TFTTool"))
+        if os.path.isdir(candidate):
+            sys.path.insert(0, candidate)
+            try:
+                import TFTTool
+                return TFTTool
+            except ImportError:
+                sys.path.pop(0)
+    return None
+
+def cmd_flash(a):
+    TFTTool = _find_tfttool()
+    if TFTTool is None:
+        print("TFTTool not found in the parent directories; cannot verify checksums of the file to flash")
+        return 1
     data = open(a.file, "rb").read()
     tft = TFTTool.TFTFile(data)
     bad = {k: v for k, v in tft.verifyChecksums().items() if not v[2]}
@@ -949,11 +962,35 @@ def cmd_flash(a):
         return 0
     chunk = 4096
     s = Screen(a.port, a.start_baud, a.verbose, a.iac)
+    # Open the console and put the parser back to idle before anything else: a baud
+    # change (or whmi-wri) that lands on a parser mid-command can leave the console
+    # stuck until a power cycle. The patient connect() waits out the panel's own
+    # console-open schedule (~3.5-5 s over the ACM/ser2net path) and resends, unlike
+    # the old 0.6 s-window _connect.
+    # A cold boot can take longer than one 6 s connect cap; retry a few times
+    # (connect is always-allowed and idempotent).
+    comok = False
+    for _ in range(5):
+        if any(f.startswith(b"comok") for f in s.connect()):
+            comok = True
+            break
+    if not comok:
+        print(f"no comok at {a.start_baud}; the console is not open - power cycle and retry")
+        return 1
+    _soft_reset(s)
     if a.start_baud != a.flash_baud:
-        # Change the rate first, with a handshake: bytes sent right after the host side changed its baud rate through a USB
-        # serial bridge are unreliable, so the first 4096 byte block of the transfer would be short and never acknowledged.
-        if not _switch_baud(s, a.flash_baud, a.start_baud):
-            print("could not move the screen to the transfer baud rate")
+        # Change the rate BEFORE the upload command (docs/commands.md): bytes sent right
+        # after a host-side rate change are unreliable, a truncated first chunk is
+        # silently dropped. After the switch the console may re-init and reopens on
+        # its own schedule, so wait for the comok patiently instead of assuming; on
+        # failure the fix is a power cycle (no automatic revert - it re-inits again
+        # and can wedge the parser).
+        s.send(f"baud={a.flash_baud}")
+        time.sleep(0.2)
+        s.ser.baudrate = a.flash_baud
+        _settle(s)
+        if not any(f.startswith(b"comok") for f in s.connect()):
+            print(f"no comok at {a.flash_baud} after the rate change: power cycle the screen and retry")
             return 1
     s.ser.write(END)
     s.ser.write(f"whmi-wri {len(data)},{a.flash_baud},0".encode() + END)
