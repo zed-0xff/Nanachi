@@ -87,8 +87,9 @@ install_peek_hook:
  *      the image) to PEEK_BLOB_DST, the safe gap that survives the stock boot. The blob is
  *      a single contiguous block (entry + peek + poke + replay + marker + tables):
  *      all intra-blob refs are PC-relative (bl/bx/ADR), all absolute literals are fixed
- *      values (the UART2/GPIO registers, the PEEK_W windows, GET_STRING8_ADDR) - no pool
- *      may point into the image (the image is dead after the stock boot).
+ *      values (the UART2/GPIO registers, GET_STRING8_ADDR; the window table is gone -
+ *      no gating since v3) - no pool may point into the image (the image is dead
+ *      after the stock boot).
  *   2. Re-writes the 0x2A1E BL word to target the gap copy (same 0x0-alias form as the
  *      cold pass; bench-confirmed the word then reads back at 0x20002A1E in the stock pass).
  *   3. I-cache reset (the shared icache_reset in stage1.S): defensive - nothing in this
@@ -228,8 +229,10 @@ pb_exit:
     bx lr
 
 /* --------------------------------------------------------------------------
- *  pb_exit_err: the error terminal: the 72 FF FF FF frame, then pb_exit. pk_marker clobbers
- *  r0-r3 only; the entry frame (36 B) is intact under sp. */
+ *  pb_exit_err: the error terminal: the 72 FF FF FF frame, then pb_exit. The 0xFF length
+ *  byte is the error sentinel: data chunks never send it (a full 255-byte chunk sends
+ *  0xFE on the wire - see cmd_peek.S), so a host-side 72 FF can only be this frame.
+ *  pk_marker clobbers r0-r3 only; the entry frame (36 B) is intact under sp. */
 .thumb_func
 pb_exit_err:
     movs r0, #0x72

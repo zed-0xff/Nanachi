@@ -20,6 +20,33 @@ SE, EC, SB, WILL, WONT, DO, DONT = 0xF0, 0xEF, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE
 # WILL x -> DO x ; DO x -> WILL x ; WONT x -> DONT x ; DONT x -> WONT x
 _ACCEPT = {WILL: DO, DO: WILL, WONT: DONT, DONT: WONT}
 
+# RFC 2217 (Cisco "Telnet Com Port Control Option"), telnet option 44 (0x2C).
+# ser2net enables it per port with ``telnet(rfc2217)`` and implements it via
+# gensio. Subcommand bytes (subneg payload = option, cmd, then the value):
+#   SET_BAUDRATE          = 1       (client -> server: request a new baud)
+#   SERVER_SET_BAUDRATE   = RSP_OFFSET(100) + 1 = 0x65  (server -> client ack)
+# The baud value is carried as 4 bytes, big-endian.
+COM_PORT_OPTION = 0x2C
+SET_BAUDRATE = 0x01
+RSP_OFFSET = 0x64
+SERVER_SET_BAUDRATE = RSP_OFFSET + SET_BAUDRATE
+
+
+def rfc2217_set_baud(baud: int) -> bytes:
+    """RFC 2217 SET-BAUDRATE subnegotiation: ``IAC SB 44 1 <4-byte big-endian baud> IAC SE``.
+
+    Asks the telnet server (ser2net with ``telnet(rfc2217)``) to reconfigure
+    the serial port's baud rate — the *host* half of a baud change. The server
+    acknowledges with a SERVER_SET_BAUDRATE (0x65) subneg carrying the baud it
+    actually set; that subneg is dropped by :class:`IacDecoder`, so it never
+    reaches the data stream. Must be sent after the COM_PORT option is active
+    (see :meth:`IacSerial.handshake`).
+    """
+    return (bytes([IAC, SB, COM_PORT_OPTION, SET_BAUDRATE,
+                  (baud >> 24) & 0xFF, (baud >> 16) & 0xFF,
+                  (baud >> 8) & 0xFF, baud & 0xFF])
+            + bytes([IAC, SE]))
+
 
 def negotiate(burst: bytes) -> bytes:
     """Build the accept-all reply to a telnet negotiation burst.
@@ -126,7 +153,7 @@ class IacSerial:
         self.ser.reset_input_buffer()
         self._dec.reset()
 
-    def handshake(self):
+    def handshake(self, rfc2217_baud: int = 0):
         """Complete the telnet negotiation with a ser2net telnet port.
 
         Reads the server's initial negotiation burst (``negotiate`` answers it by
@@ -135,6 +162,11 @@ class IacSerial:
         timeout before forwarding it -- that stall was the entire console-open
         latency; with it, the first reply arrives in ~10 ms. No-op when
         ``iac`` is false (raw link has no negotiation).
+
+        When ``rfc2217_baud`` is non-zero, an RFC 2217 subnegotiation is sent
+        right after the accept-all reply, asking ser2net to set that baud rate
+        on the serial port (the host-side half of a baud change; the panel's
+        own ``baud`` variable is separate and a no-op on a CDC-ACM port).
         """
         if not self.iac:
             return
@@ -146,9 +178,16 @@ class IacSerial:
             c = raw.read(4096)
             if c:
                 burst += c
-        reply = negotiate(burst)
-        if reply:
-            raw.write(reply)
+        out = bytearray(negotiate(burst))
+        if rfc2217_baud:
+            # Declare the COM-port option (RFC 2217) first so ser2net routes
+            # the subneg to its baud handler; the server's own DO COM_PORT in
+            # the burst is already accepted by negotiate(). Then request the
+            # new baud in the same write (one round trip, minimal latency).
+            out += bytes([IAC, WILL, COM_PORT_OPTION])
+            out += rfc2217_set_baud(rfc2217_baud)
+        if out:
+            raw.write(bytes(out))
             raw.flush()
         self.reset_input_buffer()  # the burst is consumed; clear decoder state
 

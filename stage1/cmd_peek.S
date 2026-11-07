@@ -5,9 +5,12 @@
  *   addr: hex, 0x optional (peek grammar; >8 digits wrap the 32-bit accumulator)
  *   len:  decimal, 1..PEEK_MAX_LEN
  * Reply:  one 0x5A beacon (every 0x2A1E hit), then dump frames
- *         72 <n> <n data bytes> FF FF FF (n <= 255; every full chunk is n = 0xFF),
- *         or the error frame 72 FF FF FF on bad syntax,
+ *         72 <n> <n data bytes> FF FF FF (n = 1..254 as-is; a full 255-byte chunk sends
+ *         n = 0xFE on the wire), or the error frame 72 FF FF FF on bad syntax,
  *         then the stock's own 00 invalid-instruction ack (r0 = -1 = not found).
+ *         0xFF is the only length the error frame uses, so every frame is unambiguous:
+ *         the host consumes exactly n data bytes, then the terminator - no pattern scan,
+ *         no lookahead, and data holding 0xFF/0x72/0x00 (long FF runs included) is safe.
  *
  * Called with bl from peekblob_entry (cmd.S). `bl` does not push a frame, so sp is the entry
  * frame (peekblob_entry's push {r0-r7,lr}) throughout and pb_peek leaves it untouched for the
@@ -18,7 +21,7 @@
  * This file references only cmd.S symbols (pb_exit, pb_exit_err, pk_marker,
  * pk_hex_table, pk_dec_table) and its own locals - nothing from cmd_poke.S. */
 
-.equ PEEK_MAX_LEN, 0x4000
+.equ PEEK_MAX_LEN, 0x40000
 
 .thumb_func
 pb_peek:
@@ -91,7 +94,9 @@ pb_peek:
     mov r5, r0                         // r5 = len
     // ---- dump: read the source straight out, chunked 72 <n> <data> FF FF FF frames, each
     // byte via pk_marker (the raw UART2 write). pk_marker clobbers r0-r3 only, so r4/r5/r6
-    // survive every call (the dump loop's live registers).
+    // survive every call (the dump loop's live registers). A full 255-byte chunk sends
+    // n = 0xFE on the wire: 0xFF is reserved for the error frame (pb_exit_err), so the host
+    // parses every frame positionally by n - no pattern, no lookahead.
     mov r6, r4                         // r6 = src
 .pp_chunk:
     cmp r5, #0
@@ -99,13 +104,21 @@ pb_peek:
     cmp r5, #0xFF
     ble .pp_n_ok
     movs r7, #0xFF
-    b .pp_n_set
+    b .pp_len_set
 .pp_n_ok:
     mov r7, r5
-.pp_n_set:
+.pp_len_set:
+    cmp r7, #0xFF
+    beq .pp_len_fe
+    mov r4, r7                         // r4 = the on-wire length byte (free in this loop)
+    movs r0, #0x72
+    b .pp_len_tx
+.pp_len_fe:
+    movs r4, #0xFE                     // full chunk: 0xFE on the wire; 0xFF stays the error sentinel
+.pp_len_tx:
     movs r0, #0x72
     bl pk_marker
-    mov r0, r7
+    mov r0, r4
     bl pk_marker
 .pp_data:
     ldrb r0, [r6]
