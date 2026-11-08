@@ -11,6 +11,7 @@ Answers the questions that decide whether KlipperScreen can run on the stock scr
   raw     send any command, print every reply
   peek    read panel memory as a hex dump; -w FILE saves the binary dump (needs the stage1 image's peek blob running)
   poke    write panel memory: 1-255 bytes of hex, or a whole file as @file in 255-byte chunks (needs the stage1 image's poke blob running)
+  shot    screenshot of the live framebuffer 0x60EC00 (480x272 RGB565, one 261120-byte peek): PNG by default, --raw saves it as-is
   shell   one console open, then a peek/poke/raw REPL on the same link (the slow comok is paid once, not per command)
   bench   draw command throughput at 115200 and (--fast 921600) at a higher baud rate
   flash   write a .tft with `whmi-wri` (what Sovol's `uart` does), only after the .tft checksums verified
@@ -24,6 +25,8 @@ Examples:
   screen_probe.py --port /dev/ttyS4 peek 0xE0010000 256
   screen_probe.py --port /dev/ttyS4 peek 0xE0010000 4096 -w dump.bin
   screen_probe.py --port /dev/ttyS4 poke 0x650000 @nanachi_raw.rgb565
+  screen_probe.py --port /dev/ttyS4 shot screenshot.png
+  screen_probe.py --port /dev/ttyS4 shot shot.rgb565 --raw
   screen_probe.py --port /dev/ttyS4 shell      (peek/poke/raw REPL on one open console)
 """
 import argparse
@@ -34,12 +37,20 @@ import time
 
 try:
     from .iac import IacSerial          # imported as tools.screen_probe
+    from .hmi_extract import encode_png_rgb
 except ImportError:
     from iac import IacSerial           # run as python3 tools/screen_probe.py
+    from hmi_extract import encode_png_rgb
 
 BAUDS = [115200, 921600, 9600, 230400, 460800, 57600, 38400, 19200, 4800, 2400]
 END = b"\xff\xff\xff"
 POKE_MAX = 255          # the stage1 blob's poke N cap; file pokes chunk to this
+PEEK_MAX = 32768        # the stage1 blob's peek N cap: a single peek delivers at most ~33000 bytes, so dumps larger than this must be chunked
+# The live display source buffer (blit_60ec): the framebuffer the panel scans continuously,
+# 480x272 RGB565 = 261120 bytes (pbuf->fb, 1:1 verified with a camera image)
+FB_ADDR = 0x60EC00
+FB_W, FB_H, FB_BPP = 480, 272, 2
+FB_TOTAL = FB_W * FB_H * FB_BPP
 
 # Replies of the Nextion instruction set (bkcmd=3 reports success and failure)
 RETURN_CODES = {
@@ -283,7 +294,9 @@ def _peek_parse(raw: bytes, final: bool = False):
                 break
             ln = raw[i + 1]
             if ln == 0xFF:
-                # the error sentinel: a data chunk never sends 0xFF, so a 72 FF can only be this frame
+                # the error sentinel: a data chunk never sends 0xFF, so a 72 FF can only be this frame.
+                # A frame is COMPLETE only when its 3-byte terminator has arrived (i+4 <= n). While the
+                # terminator is still in flight (i+4 > n) this is NOT a real error yet - keep reading.
                 if i + 4 > n:
                     if final:
                         err = f"corrupt error frame at {i}: {raw[i:i + 4].hex(' ')}"
@@ -312,10 +325,16 @@ def _peek_parse(raw: bytes, final: bool = False):
                     err = f"truncated frame at {i}: got {len(avail)} of {nlen} data bytes (lost in transit?)"
                 break
             else:
-                # the terminator is not where the length says: a byte was lost/shifted in transit
-                err = (f"corrupt frame at {i}: expected terminator after {nlen} data bytes, "
-                       f"got 0x{raw[j]:02x} (shifted stream)")
-                junk += raw[i:]
+                # the terminator is not where the length says. Two cases: (a) the 255-byte
+                # frame's terminator is still in flight (the read boundary split it) - then
+                # more bytes are coming and this is NOT an error yet; (b) a byte was truly
+                # lost/shifted. We can only tell after the stream goes quiet, so: if we are
+                # still reading (final=False) just stop this parse and keep the loop going;
+                # only declare it corrupt once final=True confirms no more data is arriving.
+                if final:
+                    err = (f"corrupt frame at {i}: expected terminator after {nlen} data bytes, "
+                           f"got 0x{raw[j]:02x} (shifted stream)")
+                    junk += raw[i:]
                 break
         elif raw[i:i + 3] == END:
             i += 3
@@ -369,7 +388,7 @@ def _peek_read(s, expected, wait):
     """Read one peek reply, stopping deterministically as soon as ``expected`` dump
     bytes are collected (the blob's dump is exactly ``expected`` bytes), a complete
     error frame arrives, or the stream is detected as shifted/corrupt mid-frame; a
-    0.3 s quiet period and the ``wait`` backstop cover the cases where the panel
+    0.6 s quiet period and the ``wait`` backstop cover the cases where the panel
     sends less than expected or the link never goes quiet. A stream that merely
     ends inside a frame keeps reading (final=False) and is reported on the final
     parse (final=True): truncated (bytes lost) or corrupt (terminator shifted).
@@ -385,7 +404,7 @@ def _peek_read(s, expected, wait):
             dump, err, _, _ = _peek_parse(raw)
             if err or len(dump) >= expected:
                 break
-        elif raw and time.time() - last > 0.3:
+        elif raw and time.time() - last > 0.6:
             break
     dump, err, beacons, junk = _peek_parse(raw, final=True)
     return dump, err, beacons, junk, raw
@@ -471,11 +490,73 @@ def cmd_peek(a):
     s.close()
 
 
+def _rgb565(fb: bytes, width: int) -> bytes:
+    """RGB565 -> RGB bytes (the 8-bit-precise 5/6/5 scale-up; one pixel per 2 bytes, little-endian)."""
+    n = len(fb) // 2
+    out = bytearray(n * 3)
+    for i in range(n):
+        v = fb[2 * i] | (fb[2 * i + 1] << 8)
+        o = 3 * i
+        out[o] = (v >> 11) << 3
+        out[o + 1] = (v >> 5) & 0xFC
+        out[o + 2] = (v & 0x1F) << 3
+    return bytes(out)
+
+
+def cmd_shot(a):
+    out = a.file if a.raw else (a.file if a.file.endswith(".png") else a.file + ".png")
+    s = Screen(a.port, a.baud or 115200, a.verbose, a.iac, rfc2217_baud=a.baud or 0)
+    if not _open_console(s):
+        print("shot: no comok (the console did not open; another client holds the panel, or it is mid-boot)")
+        s.close()
+        return
+    s.ser.timeout = 0.01
+    t0 = time.time()
+    # The peek blob caps a single dump at ~33000 bytes, so the 261120-byte framebuffer
+    # must be read in PEEK_MAX-byte chunks. Each chunk is its own peek line (a fresh
+    # priming line is NOT needed - the console is already open and the parser is primed
+    # by _open_console's throwaway line; the blob answers every subsequent peek line).
+    fb = b""
+    for off in range(0, FB_TOTAL, PEEK_MAX):
+        n = min(PEEK_MAX, FB_TOTAL - off)
+        s.ser.reset_input_buffer()
+        s.buf = b""
+        s.send(f"peek 0x{FB_ADDR + off:x},{n}")
+        part, err, _, _, _ = _peek_read(s, n, a.wait)
+        fb += part
+        if err or len(part) < n:
+            break      # a short/failed chunk: stop; the remainder is missing
+    s.close()
+    dt = time.time() - t0
+    if not fb:
+        print("shot: no framebuffer data (" + (f"{err}" if err else "the peek blob is not installed on this boot?"))
+        return
+    if err:
+        print(f"shot: {err} (truncated at {len(fb)} bytes)")
+    if len(fb) < FB_TOTAL:
+        print(f"shot: only {len(fb)}/{FB_TOTAL} bytes of the framebuffer (truncated)")
+        out = out + ".partial"
+    try:
+        with open(out, "wb") as f:
+            if a.raw:
+                f.write(fb)
+            else:
+                # a truncated dump ends mid-row: cut at the last complete row before encoding
+                n = len(fb) // FB_BPP * FB_BPP
+                fb = fb[:n]
+                f.write(encode_png_rgb(FB_W, n // (FB_W * FB_BPP), _rgb565(fb, FB_W)))
+    except OSError as e:
+        print(f"  cannot write {out}: {e}")
+        return
+    kind = "raw RGB565" if a.raw else "PNG"
+    print(f"  wrote {len(fb)} bytes to {out} ({kind}) in {dt:.2f} s")
+
+
 def _poke_reply(s, wait):
     """Read one poke reply, stopping as soon as the answer is complete: the Z beacon
     (success - the write is not echoed) or the 72 FF FF FF error frame (the 0xFF length
     is the error sentinel; poke frames never use it for data), both arrive whole; the
-    0.3 s quiet period and the ``wait`` backstop cover the no-answer case (the line
+    0.6 s quiet period and the ``wait`` backstop cover the no-answer case (the line
     never reached the blob). Returns ``(dump, err, beacons, junk)``."""
     raw, last = b"", time.time()
     s.ser.timeout = 0.01               # tight poll: the Z-beacon / error reply is noticed within ~10 ms
@@ -488,7 +569,7 @@ def _poke_reply(s, wait):
             _, err, beacons, _ = _peek_parse(raw)
             if err or beacons:
                 break
-        elif raw and time.time() - last > 0.3:
+        elif raw and time.time() - last > 0.6:
             break
     return _peek_parse(raw, final=True)
 
@@ -1040,18 +1121,24 @@ def main():
     k.add_argument("addr", type=lambda s: int(s, 0), help="start address (0x hex or decimal)")
     k.add_argument("length", type=lambda s: int(s, 0), help="bytes to dump (must be < 0x4000 and inside one readable window)")
     k.add_argument("-w", "--write", metavar="FILE", help="write the binary dump to FILE (raw bytes, no hex formatting)")
-    k.add_argument("--wait", type=float, default=3.0, help="max seconds to wait for the dump (a 0.3 s quiet period ends it early)")
+    k.add_argument("--wait", type=float, default=3.0, help="max seconds to wait for the dump (a 0.6 s quiet period ends it early)")
     k.set_defaults(fn=cmd_peek)
 
     pk = sub.add_parser("poke", help="write panel memory (needs the stage1 image's poke blob running): 1-255 bytes of hex, or a whole file as @file in 255-byte chunks; a success answers no frame, --verify re-reads with peek (hex only)")
     pk.add_argument("addr", type=lambda s: int(s, 0), help="start address (0x hex or decimal), inside one readable window (no alignment needed)")
     pk.add_argument("data", help="the bytes to write as hex, 1-255 bytes (2 digits per byte; an optional 0x prefix is fine), or @<filename> to write the whole file (255-byte chunks, each confirmed by the Z beacon)")
     pk.add_argument("--verify", action="store_true", help="after a successful poke, peek the range back and compare (hex mode only)")
-    pk.add_argument("--wait", type=float, default=3.0, help="max seconds to wait for the readback (a 0.3 s quiet period ends it early)")
+    pk.add_argument("--wait", type=float, default=3.0, help="max seconds to wait for the readback (a 0.6 s quiet period ends it early)")
     pk.set_defaults(fn=cmd_poke)
 
+    sh = sub.add_parser("shot", help="screenshot of the live framebuffer 0x60EC00 (480x272 RGB565, one 261120-byte peek): PNG by default, --raw saves it as-is (needs the stage1 image's peek blob running)")
+    sh.add_argument("file", help="output path; without --raw a .png extension is added when missing (raw: as-is, 261120 bytes)")
+    sh.add_argument("--raw", action="store_true", help="save the framebuffer as-is (raw RGB565, 261120 bytes) instead of a PNG")
+    sh.add_argument("--wait", type=float, default=10.0, help="max seconds to wait for the full dump (a 0.6 s quiet period ends it early)")
+    sh.set_defaults(fn=cmd_shot)
+
     sh = sub.add_parser("shell", help="one console open, then a peek/poke/raw REPL on the same link (the 3.5-5 s comok is paid once)")
-    sh.add_argument("--wait", type=float, default=3.0, help="max seconds per command (a 0.3 s quiet period ends it early)")
+    sh.add_argument("--wait", type=float, default=3.0, help="max seconds per command (a 0.6 s quiet period ends it early)")
     sh.set_defaults(fn=cmd_shell)
 
     u = sub.add_parser("upload")

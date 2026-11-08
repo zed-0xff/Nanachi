@@ -280,19 +280,21 @@ def _png_chunk(tag, data):
     return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
 
 
-def write_png_rgb(path, width, height, rgb_bytes):
-    """Writes a plain 8-bit RGB PNG using only the standard library (no Pillow dependency)."""
-    stride = width * 3
+def encode_png_rgb(width, height, rgb_bytes):
+    """-> PNG (plain 8-bit RGB) of ``width * height`` RGB bytes; stdlib zlib only, no Pillow."""
     raw = bytearray()
     for y in range(height):
         raw.append(0)  # filter type: none
-        raw.extend(rgb_bytes[y * stride:(y + 1) * stride])
+        raw.extend(rgb_bytes[y * width * 3:(y + 1) * width * 3])
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr)
+            + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + _png_chunk(b"IEND", b""))
+
+
+def write_png_rgb(path, width, height, rgb_bytes):
+    """Writes a plain 8-bit RGB PNG using only the standard library (no Pillow dependency)."""
     with open(path, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n")
-        f.write(_png_chunk(b"IHDR", ihdr))
-        f.write(_png_chunk(b"IDAT", zlib.compress(bytes(raw), 9)))
-        f.write(_png_chunk(b"IEND", b""))
+        f.write(encode_png_rgb(width, height, rgb_bytes))
 
 
 # ---------------------------------------------------------------------------------------------------------------
