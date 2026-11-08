@@ -542,9 +542,12 @@ def cmd_shot(a):
             if a.raw:
                 f.write(fb)
             else:
-                # a truncated dump ends mid-row: cut at the last complete row before encoding
+                # a truncated dump ends mid-row: cut at the last complete row before encoding.
+                # The peeked framebuffer comes back in the panel's raw scan order, which is
+                # rotated 180 deg relative to the physical screen (verified vs the camera), so
+                # rotate it back to match what is actually on the glass.
                 n = len(fb) // FB_BPP * FB_BPP
-                _rgb565(fb[:n], FB_W).save(f, "PNG")
+                _rgb565(fb[:n], FB_W).rotate(180).save(f, "PNG")
     except OSError as e:
         print(f"  cannot write {out}: {e}")
         return
