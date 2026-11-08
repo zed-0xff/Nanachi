@@ -37,10 +37,8 @@ import time
 
 try:
     from .iac import IacSerial          # imported as tools.screen_probe
-    from .hmi_extract import encode_png_rgb
 except ImportError:
     from iac import IacSerial           # run as python3 tools/screen_probe.py
-    from hmi_extract import encode_png_rgb
 
 BAUDS = [115200, 921600, 9600, 230400, 460800, 57600, 38400, 19200, 4800, 2400]
 END = b"\xff\xff\xff"
@@ -490,17 +488,20 @@ def cmd_peek(a):
     s.close()
 
 
-def _rgb565(fb: bytes, width: int) -> bytes:
-    """RGB565 -> RGB bytes (the 8-bit-precise 5/6/5 scale-up; one pixel per 2 bytes, little-endian)."""
-    n = len(fb) // 2
-    out = bytearray(n * 3)
-    for i in range(n):
-        v = fb[2 * i] | (fb[2 * i + 1] << 8)
-        o = 3 * i
-        out[o] = (v >> 11) << 3
-        out[o + 1] = (v >> 5) & 0xFC
-        out[o + 2] = (v & 0x1F) << 3
-    return bytes(out)
+def _rgb565(fb: bytes, width: int) -> "Image.Image":
+    """RGB565 little-endian framebuffer -> a Pillow RGB image.
+
+    One pixel per 2 bytes: R = v>>11 (5 b), G = (v>>5)&0x3F (6 b), B = v&0x1F (5 b),
+    each padded to its top 8-bit value (identical to the pre-NumPy hand loop).
+    """
+    import numpy as np
+    from PIL import Image
+    v = np.frombuffer(fb[:len(fb) // 2 * 2], dtype=np.uint16).astype(np.uint32)
+    rgb = np.empty((len(v), 3), dtype=np.uint8)
+    rgb[:, 0] = (v >> 11) << 3
+    rgb[:, 1] = ((v >> 5) & 0x3F) << 2
+    rgb[:, 2] = (v & 0x1F) << 3
+    return Image.fromarray(rgb.reshape(len(v) // width, width, 3))
 
 
 def cmd_shot(a):
@@ -543,8 +544,7 @@ def cmd_shot(a):
             else:
                 # a truncated dump ends mid-row: cut at the last complete row before encoding
                 n = len(fb) // FB_BPP * FB_BPP
-                fb = fb[:n]
-                f.write(encode_png_rgb(FB_W, n // (FB_W * FB_BPP), _rgb565(fb, FB_W)))
+                _rgb565(fb[:n], FB_W).save(f, "PNG")
     except OSError as e:
         print(f"  cannot write {out}: {e}")
         return

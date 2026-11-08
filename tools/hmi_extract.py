@@ -108,7 +108,6 @@ import os
 import re
 import struct
 import sys
-import zlib
 
 RECORD_SIZE = 28
 IB_HEADER_SIZE = 27
@@ -254,47 +253,26 @@ def decode_i_raw(data, landscape=False):
     if w == 0 or h == 0 or payload_size != w * h * 2 or I_RAW_HEADER_SIZE + payload_size != len(data):
         return None
 
-    pixels = struct.unpack_from(f"<{w * h}H", data, I_RAW_HEADER_SIZE)
-    rgb = bytearray(w * h * 3)
-
-    def put(o, v):
-        rgb[o] = (v >> 11 & 0x1f) * 255 // 31
-        rgb[o + 1] = (v >> 5 & 0x3f) * 255 // 63
-        rgb[o + 2] = (v & 0x1f) * 255 // 31
-
+    import numpy as np
+    v = np.frombuffer(data[I_RAW_HEADER_SIZE:I_RAW_HEADER_SIZE + w * h * 2], dtype=np.uint16).astype(np.uint32)
     if landscape:
-        idx = 0
-        for x in range(w):
-            for yy in range(h):
-                y = h - 1 - yy
-                put((y * w + x) * 3, pixels[idx])
-                idx += 1
-    else:
-        for idx, v in enumerate(pixels):
-            put(idx * 3, v)
-
+        # storage is (w, h) with x the slow axis and yy the fast axis; the screen row is h-1-yy,
+        # so reverse the yy axis and transpose to (h, w) to match the old nested-loop rotation
+        v = v.reshape(w, h)[:, ::-1].transpose(1, 0)
+    v = v.reshape(-1)
+    # exact 8-bit scale-up (matches the pre-NumPy `* 255 // N` integer math)
+    rgb = np.empty((len(v), 3), dtype=np.uint8)
+    rgb[:, 0] = ((v >> 11) & 0x1F) * 255 // 31
+    rgb[:, 1] = ((v >> 5) & 0x3F) * 255 // 63
+    rgb[:, 2] = (v & 0x1F) * 255 // 31
     return w, h, bytes(rgb)
 
 
-def _png_chunk(tag, data):
-    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
-
-
-def encode_png_rgb(width, height, rgb_bytes):
-    """-> PNG (plain 8-bit RGB) of ``width * height`` RGB bytes; stdlib zlib only, no Pillow."""
-    raw = bytearray()
-    for y in range(height):
-        raw.append(0)  # filter type: none
-        raw.extend(rgb_bytes[y * width * 3:(y + 1) * width * 3])
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    return (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr)
-            + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + _png_chunk(b"IEND", b""))
-
-
 def write_png_rgb(path, width, height, rgb_bytes):
-    """Writes a plain 8-bit RGB PNG using only the standard library (no Pillow dependency)."""
-    with open(path, "wb") as f:
-        f.write(encode_png_rgb(width, height, rgb_bytes))
+    """Writes a plain 8-bit RGB PNG via Pillow (replaces the hand-rolled zlib encoder)."""
+    import numpy as np
+    from PIL import Image
+    Image.fromarray(np.frombuffer(rgb_bytes, dtype=np.uint8).reshape(height, width, 3)).save(path, "PNG")
 
 
 # ---------------------------------------------------------------------------------------------------------------
