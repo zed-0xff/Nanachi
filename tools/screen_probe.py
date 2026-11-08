@@ -470,7 +470,7 @@ def _peek_run(s, addr, length, wait, verbose=False, hexdump=True):
 def cmd_peek(a):
     s = Screen(a.port, a.baud or 115200, a.verbose, a.iac, rfc2217_baud=a.baud or 0)
     if not _open_console(s):
-        print("peek: no comok (the console did not open; another client holds the panel, or it is mid-boot)")
+        print("peek: no comok")
         s.close()
         return
     dump, err, tail = _peek_run(s, a.addr, a.length, a.wait, a.verbose, hexdump=a.write is None)
@@ -508,7 +508,7 @@ def cmd_shot(a):
     out = a.file if a.raw else (a.file if a.file.endswith(".png") else a.file + ".png")
     s = Screen(a.port, a.baud or 115200, a.verbose, a.iac, rfc2217_baud=a.baud or 0)
     if not _open_console(s):
-        print("shot: no comok (the console did not open; another client holds the panel, or it is mid-boot)")
+        print("shot: no comok")
         s.close()
         return
     s.ser.timeout = 0.01
@@ -691,7 +691,7 @@ def cmd_poke(a):
             return
     s = Screen(a.port, a.baud or 115200, a.verbose, a.iac, rfc2217_baud=a.baud or 0)
     if not _open_console(s):
-        print("poke: no comok (the console did not open; another client holds the panel, or it is mid-boot)")
+        print("poke: no comok")
         s.close()
         return
     if data is not None:
@@ -713,7 +713,7 @@ def cmd_shell(a):
     ``raw CMD...``, ``quit``."""
     s = Screen(a.port, a.baud or 115200, a.verbose, a.iac, rfc2217_baud=a.baud or 0)
     if not _open_console(s):
-        print("shell: no comok (the console did not open; another client holds the panel, or it is mid-boot)")
+        print("shell: no comok")
         return 1
     print("console open. peek ADDR [LEN] | poke ADDR HEX | raw CMD... | quit")
     while True:
