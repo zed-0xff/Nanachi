@@ -1,3 +1,0 @@
-[submodule "docker/.config/opencode/plugins/opencode-prune-images"]
-	path = docker/.config/opencode/plugins/opencode-prune-images
-	url = https://github.com/Sugamsss/opencode-prune-images.git
