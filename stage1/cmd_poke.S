@@ -11,8 +11,11 @@
  *            happens, then the stock's 00 ack follows; the host verifies with a peek.
  *   error:   72 FF FF FF (bad syntax / short data / N > 255),
  *            then the stock's 00 ack.
- * Bench truth (2026-11-06, stock pass): only W2 (SRAM0, 0x20000000) is writable; stores into
- * W3 (PSRAM) / W4 / W1 (flash) are silently dropped (no fault, no IWDG).
+ * Bench truth (stock pass, corrected 2026-11-12): ALL RAM is poke-writable - the SDRAM arena
+ * 0x0-0x1000000 (16 MB) and SRAM0 0x20000000. The 2026-11-06 "only SRAM0 writable, other stores
+ * dropped" line was a false negative: only 0x20000000 was ever positively tested, and the
+ * 2026-11-07 0x650000 arena poke persisted and read back byte-for-byte on a fresh console.
+ * Not writable RAM: flash XIP (0x10000000 / 0xE0000000) and the 0x40000000 IO/peripheral region.
  *
  * Called with bl from peekblob_entry (cmd.S). `bl` does not push a frame, so sp is the entry
  * frame (peekblob_entry's push {r0-r7,lr}) throughout and pb_poke leaves it untouched for the

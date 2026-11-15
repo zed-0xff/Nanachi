@@ -763,7 +763,12 @@ def cmd_shell(a):
                 while END in rawb:
                     f, rawb = rawb.split(END, 1)
                     frames.append(f)
-                print([parse_frame(f) for f in frames] or "no reply")
+                if frames:
+                    print([parse_frame(f) for f in frames])
+                else:
+                    # hexdump the undecoded bytes: the 0x5A dispatch beacon and (for a
+                    # fur to pk_marker) its 0x00 NUL say whether the target ever ran
+                    print(f"no reply (raw bytes: {rawb.hex() if rawb else 'none'})")
             else:
                 print(f"unknown '{word}' (peek ADDR [LEN] | poke ADDR HEX | raw CMD | quit)")
         except ValueError:
@@ -1096,7 +1101,7 @@ def cmd_flash(a):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--port", required=True, help="serial device, e.g. /dev/ttyS4 (or a pyserial url)")
+    p.add_argument("--port", help="serial device, e.g. /dev/ttyS4 (or a pyserial url); omitted: read from the PANEL_PORT environment variable")
     p.add_argument("--baud", type=int,
                    help="baud rate (default 115200; scan tries all when omitted). With --iac (ser2net/telnet) an "
                         "explicitly set value is also sent to ser2net at connect as an RFC 2217 SET-BAUDRATE subneg "
@@ -1172,6 +1177,10 @@ def main():
     f.add_argument("--yes-flash", action="store_true", help="really write the file (otherwise only verify it)")
     f.set_defaults(fn=cmd_flash)
     a = p.parse_args()
+    if a.port is None:
+        a.port = os.environ.get("PANEL_PORT")
+    if a.port is None:
+        p.error("no --port given and the PANEL_PORT environment variable is not set")
     sys.exit(a.fn(a) or 0)
 
 
