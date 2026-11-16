@@ -108,8 +108,25 @@ def parse_frame(f: bytes) -> str:
     return "unknown " + f.hex(" ")
 
 
+def _resolve_iac(iac, port):
+    """Resolve the ``--iac`` setting (``auto``|``on``|``off``, or a bare bool) to a boolean for a given port.
+
+    ``auto``: telnet IAC escaping only makes sense over a TCP socket to a ser2net
+    telnet port -- on for a ``socket://`` URL, off for a raw serial device
+    (``/dev/tty*``) and any other link (other pyserial URLs, loopback, ...).
+    Explicit ``on``/``off`` is honored as-is; a bare bool (direct ``Screen``
+    construction, e.g. ``blit_60ec.py``) passes through unchanged.
+    """
+    if isinstance(iac, str):
+        if iac == "auto":
+            return isinstance(port, str) and port.startswith("socket://")
+        return iac == "on"
+    return bool(iac)
+
+
 class Screen:
     def __init__(self, port, baud, verbose=False, iac=False, rfc2217_baud=0):
+        iac = _resolve_iac(iac, port)
         import serial
         ser = serial.serial_for_url(port, baudrate=baud, timeout=0.05) if "://" in port \
             else serial.Serial(port, baud, timeout=0.05)
@@ -1109,8 +1126,9 @@ def main():
                         "change) and a rate different from the panel's current one (115200) makes it re-init the "
                         "console (no comok); the real device-side lever is the panel's own `baud=` command.")
     p.add_argument("-v", "--verbose", action="store_true")
-    p.add_argument("--iac", action="store_true",
-                   help="the ser2net/telnet link escapes 0xFF (IAC): double it on send, un-double on receive (default off = raw)")
+    p.add_argument("--iac", nargs="?", const="on", default="auto", choices=["auto", "on", "off"],
+                   help="telnet IAC framing (a ser2net/telnet link escapes 0xFF: doubled on send, un-doubled on receive). "
+                         "'auto' (default): on for a socket:// port, off for a /dev/tty* device; 'on'/'off' force it; bare --iac = on")
 
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("scan").set_defaults(fn=cmd_scan)

@@ -17,7 +17,7 @@ already-running panel (no boot / power cycle), then executed with
   `0x650001`). Head `4a48 4ff0 …`. **Gitignored** (`.gitignore` `*.bin`) —
   build it first, below.
 - `common.sh` — shared setup, sourced by the two drivers: `PANEL_PORT` (required;
-  fail clear if unset), `PANEL_IAC=1` → `--iac`, the `probe()` wrapper around
+  fail clear if unset), `PANEL_IAC=1` → `--iac on`, the `probe()` wrapper around
   `tools/screen_probe.py`, the `LIVE_HEAD` blob-head constant, and `check_live`
   (every driver starts with this blob-head liveness peek).
 - `run.sh` — the whole flow: blob-head liveness peek → pre-poke dump →
