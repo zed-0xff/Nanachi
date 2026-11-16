@@ -1,7 +1,7 @@
 /*
  * Linker script for the self-contained beep blob (poked + blx'd on the running panel).
  *
- * Links stage1_buzz.S as-is at 0x650000 (a proven-writable SDRAM scratch region).
+ * Links buzz_blob.S as-is at 0x650000 (a proven-writable SDRAM scratch region).
  * Layout: .vector_table (0x40, loader-only baggage, never read on the blx path) at
  * 0x650000, then .text (entry function + its literal pool + the melody table, all
  * contiguous) right after. `entry` loads `melody` from its own literal pool, so the

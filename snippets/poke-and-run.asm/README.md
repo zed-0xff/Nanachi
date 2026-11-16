@@ -1,7 +1,7 @@
 # poke-and-run
 
 Proof-ladder rung: **poked-into-SDRAM code runs on the live panel and beeps its
-TIM5 buzzer.** The 348-byte `stage1_buzz.S` blob (entry + literal pool + the
+TIM5 buzzer.** The 348-byte `buzz_blob.S` blob (entry + literal pool + the
 "ta-daa" melody table) is poked into the SDRAM arena at `0x650000` on an
 already-running panel (no boot / power cycle), then executed with
 `fun0 0x650001` (Thumb `blx`). All linked addresses are self-consistent at
@@ -9,8 +9,10 @@ already-running panel (no boot / power cycle), then executed with
 
 ## Files
 
-- `stage1_buzz.S` — the blob source (canonical home: this folder).
+- `buzz_blob.S` — the blob source (canonical home: this folder).
 - `buzz_blob.ld` — linker script: links at `0x650000`, `.vector_table` NOLOAD.
+- `Makefile` — `make` (build `buzz_blob.bin`), `make run` (build + `run.sh`),
+  `make verify` (`verify.sh`), `make clean`.
 - `buzz_blob.bin` — the built 348-byte image (entry `0x650000`, blx target
   `0x650001`). Head `4a48 4ff0 …`. **Gitignored** (`.gitignore` `*.bin`) —
   build it first, below.
@@ -32,15 +34,11 @@ already-running panel (no boot / power cycle), then executed with
 ## Build
 
 ```sh
-cd snippets/poke-and-run.asm
-arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 -O2 \
-  -x assembler -c stage1_buzz.S -o buzz.o
-arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostdlib -nodefaultlibs \
-  -T buzz_blob.ld buzz.o -o buzz_blob.elf
-arm-none-eabi-objcopy -O binary buzz_blob.elf buzz_blob.bin
+make -C snippets/poke-and-run.asm
 ```
 
-(all artifacts — `buzz.o`, `buzz_blob.elf`, `buzz_blob.bin` — land in this folder)
+(assembles `buzz_blob.S`, links with `buzz_blob.ld`, objcopy — all artifacts,
+`buzz.o` / `buzz_blob.elf` / `buzz_blob.bin`, land in this folder)
 
 ## Run / verify
 
@@ -50,8 +48,8 @@ abort early if the blob head is not at `0x79D448`).
 ```sh
 export PANEL_PORT=/dev/ttyUSB0      # or socket://host:port for a ser2net link
 # export PANEL_IAC=1                # only for ser2net/telnet links (IAC-escaped 0xFF)
-sh snippets/poke-and-run.asm/run.sh
-sh snippets/poke-and-run.asm/verify.sh
+make -C snippets/poke-and-run.asm run
+make -C snippets/poke-and-run.asm verify
 ```
 
 `run.sh` exit codes: 0 = ok, 1 = a step failed (poke not verifiable, no `0x5A`

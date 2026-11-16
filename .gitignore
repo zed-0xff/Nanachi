@@ -3,6 +3,7 @@
 *.elf
 *.img
 *.jpg
+*.o
 *.pyc
 *.make
 *.rgb565
