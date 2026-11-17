@@ -3,7 +3,7 @@
 # and fingerprint whether the melody actually ran (independent of whether the
 # buzzer is audible). Panel I/O only via tools/screen_probe.py.
 #
-# Env: see common.sh (PANEL_PORT required, PANEL_IAC=1 optional).
+# Env: see common.sh (PANEL_PORT required).
 #
 # A completed "ta-daa" ends on note G6 with the counter stopped:
 #   CR1:0x0000 PSC:0x0063 ARR:0x04FB CCR4:0x027D CCMR1:0x7070 CCMR2:0x7070 CCER:0x3333

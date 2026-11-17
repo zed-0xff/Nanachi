@@ -6,8 +6,7 @@
 #   make verify   read back the TIM5/SYS registers and print the fingerprint (verify.sh)
 #   make clean    remove build artifacts
 #
-# Env for run/verify: PANEL_PORT (required), PANEL_IAC=1 (ser2net link) —
-# see common.sh.
+# Env for run/verify: PANEL_PORT (required) — see common.sh.
 
 CC      := arm-none-eabi-gcc
 OBJCOPY := arm-none-eabi-objcopy

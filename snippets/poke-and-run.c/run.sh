@@ -4,7 +4,7 @@
 # readback + the 0x5A fun ack. Everything talks to the panel only via
 # tools/screen_probe.py.
 #
-# Env: see common.sh (PANEL_PORT required, PANEL_IAC=1 optional).
+# Env: see common.sh (PANEL_PORT required).
 #
 # Exit codes: 0 = ok, 1 = a step failed, 2 = environment error (no PANEL_PORT,
 # missing/stale blob).

@@ -2,7 +2,6 @@
 #
 # Env:
 #   PANEL_PORT   (required) the serial URL, e.g. /dev/ttyUSB0 or socket://host:port
-#   PANEL_IAC=1  (optional) the link is a ser2net/telnet that IAC-escapes 0xFF
 
 set -u
 
@@ -20,9 +19,7 @@ BLOB="$HERE/buzz_blob.bin"
 # stage-0 image with the 0x2A1E console blob is running.
 LIVE_HEAD="ffb55a2000f05af8"
 
-IAC=""
-[ -n "${PANEL_IAC:-}" ] && IAC=--iac
-probe() { python3 "$PROBE" $IAC "$@"; }
+probe() { python3 "$PROBE" "$@"; }
 
 # check_live FILE — non-zero unless the console blob is live; reads its head
 # into FILE (8 bytes).

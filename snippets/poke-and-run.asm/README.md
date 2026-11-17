@@ -17,9 +17,10 @@ already-running panel (no boot / power cycle), then executed with
   `0x650001`). Head `4a48 4ff0 …`. **Gitignored** (`.gitignore` `*.bin`) —
   build it first, below.
 - `common.sh` — shared setup, sourced by the two drivers: `PANEL_PORT` (required;
-  fail clear if unset), `PANEL_IAC=1` → `--iac on`, the `probe()` wrapper around
-  `tools/screen_probe.py`, the `LIVE_HEAD` blob-head constant, and `check_live`
-  (every driver starts with this blob-head liveness peek).
+  fail clear if unset), the `probe()` wrapper around `tools/screen_probe.py`
+  (IAC framing is auto-resolved by the tool itself: on for `socket://` links,
+  off otherwise), the `LIVE_HEAD` blob-head constant, and `check_live` (every
+  driver starts with this blob-head liveness peek).
 - `run.sh` — the whole flow: blob-head liveness peek → pre-poke dump →
   `poke 0x650000 @buzz_blob.bin` (2×255 B chunks) → fresh-console 348-byte
   readback `cmp`'d against the blob (≤2 attempts) → `fun0 0x650001` (expect the
@@ -47,7 +48,6 @@ abort early if the blob head is not at `0x79D448`).
 
 ```sh
 export PANEL_PORT=/dev/ttyUSB0      # or socket://host:port for a ser2net link
-# export PANEL_IAC=1                # only for ser2net/telnet links (IAC-escaped 0xFF)
 make -C snippets/poke-and-run.asm run
 make -C snippets/poke-and-run.asm verify
 ```
