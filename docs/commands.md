@@ -9,9 +9,11 @@ UART via a USB-serial bridge (`tools/screen_probe.py --port ...`). Three layers:
    second table (`ramv`, `flashup`, `cpufreq`, ...) before falling back to a real variable, reached the same way as a
    normal read/write but not in any instruction table or editor menu.
 
-Everything is marked per-cell, from two ground truths: the AiHmiT7 firmware 159 (`app_10000_plain.bin`, decompiled as
-`app_10000.c`, see `sovol/flash_layout.md`) and the editor's own hint files (`ext/HMI/USARTHMI/ch0_com.bin` /
-`ch0_va.bin`, an older build's command/variable descriptions, XORed with `0x05`, in Chinese). Status legend:
+Everything is marked per-cell, from three sources: the AiHmiT7 firmware 159 (`app_10000_plain.bin`, decompiled as
+`app_10000.c`, see `sovol/flash_layout.md`), the editor's own hint files (`ext/HMI/USARTHMI/ch0_com.bin` /
+`ch0_va.bin`, an older build's command/variable descriptions, XORed with `0x05`, in Chinese), and the official
+vendor manual (translated in [`tjc_official.md`](tjc_official.md)) — the last is the generic product-line reference
+(📕): where it conflicts with a finding on this build, this build wins. Status legend:
 
 | Mark | Meaning |
 |---|---|
@@ -20,6 +22,7 @@ Everything is marked per-cell, from two ground truths: the AiHmiT7 firmware 159 
 | 🔍 | Inferred from the firmware code (name, operand count/kind), not tested |
 | ⚠️ | Undocumented hidden function, reverse-engineered from the decompiled firmware |
 | 🧩 | Confirmed by real, commented production code from a **different** TJC/Nextion device (not this screen's firmware) — the instruction set is shared across the product line, but exact behavior on this specific firmware build is not independently confirmed |
+| 📕 | The **official TJC/Nextion vendor manual** (translated in [`tjc_official.md`](tjc_official.md)) — the generic product-line reference; confirms operand signatures/semantics for this family but is not independently tested on this specific build |
 
 In the firmware there are two full name tables (`tools/fw_tables.py` extracts them): a **53-entry table** for commands
 with a free-form string operand (names ≤ 8 bytes) and a **41-entry table** for fixed-operand-count commands (names ≤ 4
@@ -29,8 +32,12 @@ separate concern that need not match the serial syntax documented here.
 **Dispatch (found in the firmware, IDB names in parentheses).** Four name lists sit back to back at `0x2F168`:
 `strings53` (instructions with a string operand, 12-byte entries `name[8], group, argc, argtype, opcode`),
 `strings41` @`0x2F3E4` (fixed-size instructions, 8-byte entries `name[4], group, argc, argtype, opcode`),
-`strings59` @`0x2F530` and `strings22` @`0x2F708` (the system variables / colour constants with short and long names,
-`name, id` — `id` `0xC8` marks a colour constant, the other bytes are the variable id; not instructions).
+`strings59` @`0x2F530` (59 × 8-byte entries: `name[4]` + 4-byte little-endian `id`) and `strings22` @`0x2F708`
+(22 × 12-byte entries: `name[8]` + 4-byte `id`) — the system variables and colour constants; not instructions.
+Colour constants carry `id` = 0x00C8 with the 16-bit colour value in the upper half (e.g. RED = 0xF80000C8 → 63488,
+all eight match the 📕 colour table); ordinary variables carry small ids (`dp` 0x16, `usup` 0x19, `addr` 0x1A, …).
+The table contains **no `sys0/1/2`** — the resolver function `sub_1E248` (name <5 chars → `strings59`, 5–8 →
+`strings22`; `u[…]`/`r[…]` special-cased) has no sys branch, and no `sysN` string exists anywhere in the binary.
 For an instruction, `group` indexes an 8-slot pointer array at `0x2F148` and `opcode` is passed to that handler as its
 second argument:
 
@@ -54,12 +61,25 @@ function `cmd_<name>`).
   literally inside a command (a path, a string, ...) — the usual Nextion/TJC limit.
 * **`connect`**: asks the screen to identify itself. Reply: `comok <touch_type>,<a>-<b>,<model>,<firmware>,<mcu_code>,
   <serial>,<flash_size>-<c>` — confirmed on this screen: `comok 2,1073-0,TJC4827X243_011C,159,10201,
-  570235016C577237,16777216-0`.
+  570235016C577237,16777216-0`. Field meanings per the vendor manual (📕): `<touch>` = 1 with touch / 0
+  without, reserved internal data, model, firmware version number, MCU internal code, unique serial
+  number, flash size in bytes (the trailing `-<c>` on this build is not in the vendor example). ⚠️ Independent TJC
+  uploaders (the RE repo's `tjc_serial_upload.py`, different `011N` panel) additionally send the junk prefix
+  `DRAKJHSUYDGBNCJHGJKSHBDN` + `FF FF FF` first, then `connect` **twice** (the first is routinely swallowed) before
+  reading `comok` — the double send is what makes their connect robust across the probe-baud loop.
 * **Return codes** (when `bkcmd` allows them; one byte + `FF FF FF`, see `tools/screen_probe.py`
   `RETURN_CODES` for the full table): `0x01` instruction successful, `0x00` invalid instruction, `0x02` invalid
   component id, `0x03` invalid page id, `0x06` file operation failed, `0x1a` invalid variable name/attribute,
   `0x1c` assignment failed, `0x24` serial buffer overflow, `0xfe`/`0xfd` "ready for data"/"transfer finished" (`twfile`),
-  `0x88` system started.
+  `0x88` system started. The vendor manual (📕, [`tjc_official.md`](tjc_official.md) §5) lists the rest of the family:
+  `0x04` invalid picture id, `0x05` invalid font id, `0x09` CRC check failed, `0x11` invalid baud-rate value,
+  `0x12` invalid curve id/channel, `0x1b` invalid variable operation (e.g. a quoted number, an unquoted string),
+  `0x1d` EEPROM operation failed, `0x1e` invalid parameter quantity, `0x1f` IO operation failed,
+  `0x20` escape character misused, `0x23` variable name too long. Code written in the editor is unaffected by
+  `bkcmd`: it always returns on error and never on success.
+* **Other reply frames** (📕, all `FF FF FF`-terminated): `0x86` the device entered sleep automatically (not a
+  `sleep=1` command), `0x87` the device woke up automatically (not a `sleep=0` command), `0x89` an SD card was
+  detected at power-on and the device entered its upgrade UI.
 * **`get`/`gets` replies**: a number is `0x71` + 4-byte little-endian signed int + `FF FF FF`; a string is `0x70` +
   text + `FF FF FF`.
 * **Touch**: object touch events are `0x65 <page> <component> <press=1/release=0>`; `sendxy=1` additionally emits
@@ -83,7 +103,74 @@ function `cmd_<name>`).
   the write from that point, instead of restarting from byte 0. The exact meaning of `X` (whether it is the actual
   resume offset the firmware trusts, or just a marker it checks against its own state) is not pinned down, and this
   has **not been tried on hardware** — worth testing deliberately before relying on it, since getting the match
-  criteria wrong risks writing new data at the wrong offset.
+  criteria wrong risks writing new data at the wrong offset. ⚠️ Corroborated on a different panel: the TJC RE repo's
+  uploader (`tjc_serial_upload.py`, `TJC3224T132_011N`) runs `whmi-wris <size>,<baud>,1` and observed exactly this —
+  the first 4096-byte block was acked `0x08` + a 4-byte little-endian skip-ahead offset (the panel skips over
+  resources it already has matching, ~1 s to compute), every following block acked `0x05` as usual. So the skip-ahead
+  is real firmware behaviour, not just a decompilation reading. On this screen it has not been exercised:
+  `tools/screen_probe.py flash` uses `whmi-wri …,0`, whose first ack is the plain `0x05`.
+
+## Output ports: the two UART objects, `printport`/`umport`
+
+`main` builds two UART objects, one per physical UART peripheral:
+
+| | `g_uart1` @0x2B174 | `g_uart2` @0x2B1A4 |
+|---|---|---|
+| Peripheral | **UART2** (register block `0x40006000`) — the host wire | **UART5** (the second peripheral) |
+| obj `+0x14` (send 1 byte) | `uart_poll_byte` → `uart_send_data` | `uart_data_process` → `uart_send_response` |
+| obj `+0x18` (send buffer) | `uart_read_byte` → `uart_send_data` | `uart_recv_data` → `uart_send_response` |
+| TX path | 0x400-byte ring (`dword_761314`) → `uart_write_byte` → UART2 DR; TX gated by `byte_7612A4` (non-zero = drop) and `byte_7612A5` (must be 1 for the DR write) | direct UART5 write; clock/baud set by `uart_check_ready` (only called from `uart2: N≠0`) |
+| obj `+0x1C` (RX processing) | `process_cmd` — the command parser of this protocol | 1 (none) |
+| obj `+0x20` / `+0x24` | `sub_17A6E` / `irq_sub_17ADC` (`UART2_Handler`) | `uart_widget_tx` / `irq_sub_17AB8` |
+| post-ctor init | — | `UART::sub_2CDA0(&g_uart2, rxbuf, 0x4000)` |
+
+All protocol replies (`connect`/`get`/… through `reply_ok`/`send_resp`) go out on **`g_uart1`**, so the host
+wire is UART2.
+
+Two pointer globals select where the *output* instructions send:
+
+* `*gpUartB` @0x761394 — the target of `print`, `prints`, `printh`, `rprint` (each through the object's `+0x14`/`+0x18` slot).
+* `*gpUartA` @0x761390 — the target of the `u` family: `uwritef`/`uwriter` (0x80-byte chunks via `UART::uwrite_common`), the raw `repo`/`rept` read-back, `crcputu`, `udelete`.
+
+Both are written by **exactly two hidden commands** (the only store sites anywhere in the image — checked by xref
+and by a full-image byte scan of the address literals):
+
+* `sets "printport: N"` → `*gpUartB = &g_uart1` (N≠2) or `&g_uart2` (N==2).
+* `sets "umport: N"` → `*gpUartA = &g_uart1` (N≠2) or `&g_uart2` (N==2).
+
+Neither is ever initialized at boot: no constructor, `main`, or stage-0 loader writes them — they are BSS and hold
+whatever the RAM holds at reset (presumably 0). A NULL target would dereference the vector-table region when a
+print-family command arrives, so **the host must send `sets "printport: 1"` before using the print family** (or
+`2`). With `printport: 1`, `print`/`prints`/`printh`/`rprint` emit on the **same UART2 wire as the normal
+replies** — this is the way to make the panel send arbitrary bytes/strings to the host:
+
+```
+sets "printport: 1"        # once, at the start of a session
+prints "BLACK",0           # literal text, raw
+printh 48 65 6c 6c 6f      # arbitrary bytes (hex values); each byte is also fed to the running CRC
+print <var>                # a variable's value: string raw, number as little-endian int
+rprint <var>,<n>           # n bytes of a buffer variable
+```
+
+`print`/`prints` and `get` share one send core, `CmdCtx::cmd_get(ctx, flag, len)`; `flag` is the only difference:
+
+* **`print`/`prints` → `cmd_get(ctx, 0, len)`**: sends the value through the target object's `+0x18` slot **only** — a string variable goes out as its raw bytes (length `len`, or the full string if `len` is 0/omitted), a number as its little-endian bytes (clamped to 4, or `len` if smaller). **No marker, no `FF FF FF` terminator** — the host sees a clean, unframed raw byte string. This is the cleanest way to push arbitrary data onto the wire.
+* **`get` → `cmd_get(ctx, 1, 0)`**: framed — a one-byte marker first (`'p'` 0x70 for a string, `'q'` 0x71 for a number, sent via the `+0x14` slot), then the same value via `+0x18`, then `FF FF FF` (three `0xFF` via `+0x14`). That is the normal protocol reply shape.
+* **`printh`** does not use `cmd_get`: it loops its hex args and sends **one byte at a time** via the target's `+0x14` slot, feeding each byte to the running `crc_put`. No terminator.
+
+`sets "printport: 2"` redirects the same output to UART5. Guess: UART5's clock is only started by
+`uart_check_ready`, which `uart2: N≠0` calls (and which `uart2: 0` reverses), so a `printport: 2` without a
+preceding `uart2: N` likely produces no output at all.
+
+Only the `cmd_get`-based paths — `print`, `prints`, and `get` — check `g_send_locked` @0x762248 (a byte; the
+adjacent `+4` is `g_baud`): while non-zero the send is silently dropped (no error reply). It is BSS (0 at
+power-on) and set to 1 by `tfr_ack` during a firmware transfer, so a stuck/in-flight update mutes
+`print`/`prints` output but **not** `printh` or `rprint` (neither carries that check). All of them are separately
+gated at the UART level by `byte_7612A4`/`byte_7612A5` (the TX-enable pair, set once the host has been talking).
+
+Everything in this section is decompilation of fw159 (the store sites, the object slot map, the gates); live
+behaviour on this screen is unverified — the current gateway build exposes no UART stream, so it could not be
+tested from this environment.
 
 ### String-argument instructions (53 entries)
 
@@ -92,34 +179,34 @@ function `cmd_<name>`).
 | `click` | obj, event | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Fires a component's press/release event. |
 | `comok` | — | ✅ tested (part of the base serial protocol) | Reply to `connect`; never sent by the host, see the protocol section above. |
 | `btlen` | att0, att1 | 📖+🧩 editor description, operand roles confirmed by a different TJC device's production code (community nspanel project, `btlen tSend.txt,sys0`) | Tests a string variable's (`att0`) length in bytes, written into `att1`. |
-| `redir` | — | 🔍 inferred from the firmware code, not tested | Likely redirects file I/O to a different directory/port; grouped with the other ram/sd0 file commands. |
+| `redir` | — | 🔍+📕 not tested | The vendor manual (📕, tagged X3/X5-only) describes it as a **directory rename**: `redir srcdir,decdir`, e.g. `redir "sd0/a/","sd0/b/"` — not the "redirect file I/O" guessed earlier; grouped with the other ram/sd0 file commands. |
 | `spstr` | src.txt, dest.txt, separator, index | 🧩 confirmed syntax from a different TJC device's production code (community nspanel project, `spstr strCommand.txt,tIcon1.txt,"~",2`) | Splits `src.txt` on `separator` and writes the `index`-th token (0-based) into `dest.txt`. |
-| `print` | att | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Sends a variable/constant value over the serial port, unformatted. |
+| `print` | att | 🔍 decompiled (fw159), not tested | `cmd_get(ctx,0,0)` through `*gpUartB` (the `printport`-selected object, see the output-ports section): a string variable goes out as its **raw bytes** (full length), a number as **little-endian bytes clamped to 4**. **No marker, no `FF FF FF` terminator** — clean raw output. Silently dropped while `g_send_locked` is non-zero. **`sets "printport: 1"` first** to get it onto the host wire. |
 | `ucopy` | dest, start, len, flag | 🧩 confirmed syntax from a different TJC device's production code (community nspanel project, `ucopy payloadLength,2,2,0` / `ucopy strCommand.txt,4,payloadLength-5,0`) | **Correction — not a file copy, as previously guessed here:** copies `len` bytes starting at offset `start` of the serial **receive buffer** (`u[]`, see `usize`) into `dest` (a `.val` or `.txt` variable). `flag`'s meaning not determined. |
 | `code_c` | — | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Clears the serial command receive buffer. No parameters. |
 | `draw3d` | x, y, x2, y2, style, color | 🔍 inferred from the firmware code, not tested | Likely draws a 3D/bevelled rectangle (sunken or raised), the usual Nextion-family `draw3d`. |
 | `qrcode` | x, y, w, ecc, string | 🔍 inferred from the firmware code, not tested | Draws a QR code — the firmware has a full from-scratch QR encoder (format-info BCH, 8 mask patterns, see sovol/flash_layout.md). Exact argument order not confirmed on hardware. |
-| `rdfile` | — | 🔍 inferred from the firmware code, not tested | Likely reads a ram/ or sd0/ file into a variable (the counterpart of `twfile`/`refile`). |
-| `refile` | — | 🔍 inferred from the firmware code, not tested | Likely renames/replaces a ram/ or sd0/ file. |
-| `twfile` | path, size | ✅ tested on this screen | Framed file upload into ram/ or sd0/: `twfile "path",size`, wait for `0xFE` ("ready"), send 4082-byte frames `3A A1 BB 44 7F FF FE 01 <id:u16> <len+2:u16> <data> <CRC16/MODBUS LE>`, each acked `0x05`; `0xFD` ends. **Framed only** — `screen_probe.py upload --raw` (bare bytes) makes the receiver wait past `0xFE`: no answer until power cycle, `sd0/` left as `<name>.tm`; empty `twfile` after `0xFE` blocks the same way. Framed `sd0/` commits (~10.7 KiB/s @115200). `ram/z` |
+| `rdfile` | — | 🔍+📕 not tested | Vendor manual (📕, tagged X3/X5-only) gives the full form: `rdfile filepath,addr,size,crc` — passthrough read: streams `size` file bytes from offset `addr` straight out the serial port (no `get` framing); `size` 0 returns the file size instead (4-byte little-endian number); `crc` 0 = none, 1 = a 2-byte CRC16/MODBUS appended, 10 = a 4-byte standard CRC32. The read counterpart of `twfile`. |
+| `refile` | — | 🔍+📕 not tested | Likely renames/replaces a ram/ or sd0/ file. Vendor manual (📕, tagged X3/X5-only): `refile srcfilepath,decfilepath`, e.g. `refile "ram/0.jpg","ram/1.jpg"`. |
+| `twfile` | path, size | ✅ tested on this screen | Framed file upload into ram/ or sd0/: `twfile "path",size`, wait for `0xFE` ("ready"), send 4082-byte frames `3A A1 BB 44 7F FF FE 01 <id:u16> <len+2:u16> <data> <CRC16/MODBUS LE>`, each acked `0x05`; `0xFD` ends. **Framed only** — `screen_probe.py upload --raw` (bare bytes) makes the receiver wait past `0xFE`: no answer until power cycle, `sd0/` left as `<name>.tm`; empty `twfile` after `0xFE` blocks the same way. Framed `sd0/` commits (~10.7 KiB/s @115200). `ram/z` The vendor manual (📕) describes the identical framing (see [`tjc_official.md`](tjc_official.md) §7.5): 12-byte header `3A A1 BB 44 7F FF FE <type> <id:2> <size:2>` (`size` includes the CRC, 1–4096), `0x05` per-packet ack, abort packet id 65535, `0xFD` end — plus the only two accepted image formats (baseline-DCT jpg, `xi`) and the requirement that the in-project memory filesystem be sized first. |
 | `sendme` | — | ✅ tested on this screen | Sends the current page id over the serial port (reply: `0x66` + page id). No parameters. |
 | `draw_h` | x, y, x2, y2, color | 🔍 inferred from the firmware code, not tested | Likely draws a hollow/outline rectangle (`draw` fills), inferred from sitting next to `draw`. |
-| `printh` | hex | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Sends custom hex bytes over the serial port. |
+| `printh` | hex… | 🔍 decompiled (fw159), not tested | Loops its hex args and sends **one byte at a time** through `*gpUartB`'s `+0x14` slot (the `printport`-selected object), feeding each byte to the running `crc_put`. **No terminator.** Arbitrary-byte output to the host wire once `printport` is set. |
 | `strlen` | att0, att1 | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Tests a string variable's length (characters). |
 | `cfgpio` | id, state, obj | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Configures an extended IO pin's mode: 0 pull-up input, 1 bound to a component's event, 2 push-pull output, 3 PWM output, 4 open-drain (the `obj` parameter only applies to mode 1). |
 | `showqq` | — | 🔍 inferred from the firmware code, not tested | Likely shows a small on-screen popup/status icon (paired with the hidden `qqset`); purpose not confirmed. |
-| `deldir` | path | 🔍 inferred from the firmware code, not tested | Likely deletes a directory on ram/ or sd0/. |
-| `newdir` | path | 🔍 inferred from the firmware code, not tested | Likely creates a directory on ram/ or sd0/. |
+| `deldir` | path | 🔍+📕 not tested | Likely deletes a directory on ram/ or sd0/. Vendor manual (📕, tagged X3/X5-only): `deldir dir`, e.g. `deldir "sd0/a/"` — the ram/ filesystem is flat (no subdirectories), sd0/ supports them; the path ends with `/`. |
+| `newdir` | path | 🔍+📕 not tested | Likely creates a directory on ram/ or sd0/. Vendor manual (📕, tagged X3/X5-only): `newdir dir`, e.g. `newdir "sd0/a/"` (same flat-ram/subdirs-on-sd rules as `deldir`). |
 | `substr` | att0, att1, star, lenth | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Extracts a substring. |
-| `prints` | value, length | 🧩 confirmed syntax from a different TJC device (nspanel, `prints sys0,2` / `prints tSend.txt,0` / `prints crcval,2`) | **Not a formatted print:** sends `value`'s raw bytes — `length` 0 = string at its real length (same as `cov`'s `lenth`), nonzero = that many raw bytes of a numeric value (seen only with 2; 1/4 unconfirmed). The binary counterpart of `print` — this is how a page script emits an exact byte-for-byte frame (length-prefixed payload + trailing CRC) to the host. |
+| `prints` | value, length | 🔍 decompiled (fw159); syntax cross-checked against a different TJC device (nspanel) | `cmd_get(ctx,0,length)` through `*gpUartB`: sends `value`'s **raw bytes** — a string variable at `length` bytes (0/omitted = full `strlen`), a number as little-endian bytes clamped to `length` (max 4). **No marker, no `FF FF FF` terminator** (that is only added by `get`, which calls the same core with the flag set). The clean raw-data counterpart of `print`. |
 | `pa_txt` | att0, att1, beg, lenth | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Looks up the string for a given pinyin. |
 | `delfile` | path | ✅ tested | Deletes a file on ram/ or sd0/. Always answers `instruction successful` at `bkcmd=3` whether or not the file existed, so it can't probe existence (`findfile`/`rdfile` with a quoted path -> `invalid parameter quantity`, no listing command). Deleting a file that isn't the most recently drawn in the ram/ pool shifts the others' positions and silently breaks an in-flight draw — delete only the single file you just finished, right after its `ramv`/`ref`, with no other `ram/` write in between. |
-| `newfile` | path | 🔍 inferred from the firmware code, not tested | Likely creates an empty file on ram/ or sd0/ (the counterpart of `delfile`). |
+| `newfile` | path | 🔍+📕 not tested | Likely creates a file on ram/ or sd0/ (the counterpart of `delfile`). Vendor manual (📕, tagged X3/X5-only): `newfile filepath,size` — allocates `size` bytes up front (max 2147483647), the same as a `twfile` of that size. |
 | `udelete` | n | 🧩 confirmed syntax from a different TJC device's production code (community nspanel project, `udelete bufferPos-1`) | **Correction — not a variable delete, as previously guessed here:** deletes the first `n` bytes of the serial receive buffer (`u[]`/`usize`) — used to drop garbage and resync onto the next frame after a malformed one. |
 | `strsize` | — | 🔍 inferred from the firmware code, not tested |  |
 | `crcputh` | hex bytes | ⚠️🧩 reverse-engineered; syntax confirmed by a different TJC device (nspanel, `crcputh 55 bb`) | Feeds literal hex bytes (`printh`'s syntax) into the running CRC accumulator shared with `crcputs`/`crcputu`/`crcputr` (firmware `sub_94C4`) — used to checksum a fixed protocol header (`55 BB`) plus the rest of the frame via `crcrest`+`crcputs`/`crcputu`. Whether it can also checksum a ram/sd0 file, and the firmware's algorithm-selector argument, are not confirmed. |
 | `touch_j` | — | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Runs touch panel calibration. No parameters. |
-| `finddir` | pattern | 🔍 inferred from the firmware code, not tested | Likely finds directories on ram/ or sd0/ matching a pattern (counterpart of `findfile`). |
+| `finddir` | pattern | 🔍+📕 not tested | Vendor manual (📕, tagged X3/X5-only): `finddir dir,att` — same 0/1-into-a-numeric-variable convention as `findfile`; the path ends with `/`. |
 | `txtputr` | — | 🔍 inferred from the firmware code, not tested | Likely reads text into a variable (name pattern close to `crcputr`). |
 | `crcputs` | value, length | ⚠️🧩 reverse-engineered; syntax confirmed by a different TJC device (nspanel, `crcputs sys0,2` / `crcputs tSend.txt,0`) | Same `length` convention as `prints` (0 = string at real length, nonzero = that many raw bytes of a numeric value) — feeds those bytes into the running CRC accumulator (`sub_94C4`), the construction-side counterpart of `crcputu`. |
 | `randset` | minval, maxval | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Sets the range of the `rand` system variable. |
@@ -130,13 +217,13 @@ function `cmd_<name>`).
 | `lcd_dev` | 1 operand | 🔍 from the firmware code, not tested | **No-op in this firmware:** opcode 0x22's `tbb` slot is the shared "return success" stub (2 instructions, no calls), so the command is accepted and does nothing. |
 | `lhmi_cle` | — | 🔍 inferred from the firmware code, not tested | Likely clears local HMI (on-screen/application) state — a guess from the name, paired with `whmi_cle`. |
 | `whmi_cle` | — | 🔍 inferred from the firmware code, not tested | Likely cancels/clears a pending `whmi-wri` update session (`whmi` matches the update protocol’s own command prefix). Not tested — power-cycling is the tested way out of a stuck transfer. |
-| `findfile` | pattern | 🔍 inferred from the firmware code, not tested | Likely finds files on ram/ or sd0/ matching a pattern. |
+| `findfile` | pattern | 🔍+📕 not tested | Vendor manual (📕, tagged X3/X5-only) documents it as an existence check: `findfile filepath,att` — `att` is a numeric variable that receives 0 (not found) or 1 (found), e.g. `findfile "sd0/a.jpg",sys0` (also tested to fail with a quoted path on this screen, see the `delfile` row). |
 | `setbrush` | — | 🔍 inferred from the firmware code, not tested | Likely sets a fill pattern/brush used by later `draw`/`fill` calls. |
 | `ref_stop` | — | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Pauses screen refresh. No parameters. |
 | `com_stop` | — | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Pauses execution of serial commands (the always-allowed top-level commands still work, see below). No parameters. |
 | `ref_star` | — | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Resumes screen refresh. No parameters. |
 | `com_star` | — | 🧩 confirmed by a different TJC device's production fix (`ext/KlipperLCD.jcfield`, TJC4B25C12785, same AiHmiT7 firmware) — not tested here | Resumes serial-command execution. No parameters. A `com_stop`'d state (survives a boot-page script or prior session) drops every command but the always-allowed list, no error; that fork's notes (`CLAUDE.md`) saw `page main` silently ignored until `com_star` was re-sent. A stray `com_star` before the first real command costs nothing → add to `screen_bridge.py`'s `Link.open()`, which doesn't currently. |
-| `setlayer` | layer, ? | 🔍 inferred from the firmware code, not tested | Likely selects a drawing layer/z-order for subsequent draw commands. **The command table says 2 operands** (`argc` = 2, handler `cmd_setlayer` 0xF1C0), not the single `layer` listed before; the second operand is not identified. |
+| `setlayer` | layer, ? | 🔍 inferred from the firmware code, not tested | Likely selects a drawing layer/z-order for subsequent draw commands. **The command table says 2 operands** (`argc` = 2, handler `cmd_setlayer` 0xF1C0), not the single `layer` listed before; the second operand is not identified. The vendor manual (📕, tagged X3/X5-only) fills it in: `setlayer obj0,obj1` — reorders `obj0` above `obj1`; `obj1` 0 = send to the very bottom, 255 = to the very top. |
 | `doevents` | — | 📖 the editor's own description (ch0_com.bin/ch0_va.bin), not independently tested on this screen | Yields control to the screen-refresh loop (lets a pending redraw happen before the next command runs). No parameters. |
 | `timerset` | id, interval, enabled | 🔍 inferred from the firmware code, not tested | Likely reconfigures a timer component directly by id (interval, enabled) without going through `tm#.tim`/`tm#.en`. |
 | `getpassw` | — | 🔍 inferred from the firmware code, not tested | Likely returns a device password/unlock value; related to the hidden `registered` check. No operand. Not tested. |
@@ -161,7 +248,7 @@ function `cmd_<name>`).
 | `uprd` | — | 🔍 inferred from the firmware code, not tested | Likely reads data from a user/UART source into a variable ("u-read"); not pinned down. |
 | `page` | pageid | ✅ tested on this screen | Switches to a page (by id or name) and redraws it. |
 | `line` | x, y, x2, y2, color | ✅ tested on this screen | Draws a line. |
-| `move` | obj, x, y | 🔍 inferred from the firmware code, not tested | Likely moves a component to new coordinates. |
+| `move` | obj, x, y | 🔍+📕 not tested | Likely moves a component to new coordinates. The vendor manual (📕, tagged X3/X5-only) instead documents an *animated* form: `move obj,starx,stary,endx,endy,first,time` — from (starx,stary) to (endx,endy) over `time` ms, priority `first` (0–100, higher runs first; several pending moves run in priority order, one at a time). This build is X-series; which operand count it actually accepts is untested. |
 | `fill` | x, y, w, h, color | ✅ tested on this screen | Fills a rectangular area with a colour. |
 | `xnum` | x, y, w, h, font, color, background, align, digits, value | 🔍 inferred from the firmware code, not tested | Likely draws a formatted number directly (an `xstr`-style counterpart of a number component), paired with the hidden `xnumadd`. |
 | `repo` | att, add | ✅ tested on this screen | Reads a variable from the user storage area. Confirmed: `repo var,address` (bare identifier, no quotes; address first does not work — `repo address,var` fails with `eeprom operation failed`). The area is exactly 1024 bytes (addresses 0–1023), physically at flash `0x140000`/`0x150000` (A/B pair), see `sovol/flash_layout.md`. |
@@ -186,32 +273,37 @@ function `cmd_<name>`).
 | `rest` | — | ✅ tested on this screen | Resets (reboots) the device. No parameters. Confirmed a real reboot: a `dp` page-state marker set beforehand clears back to the default page (see the `dp` row), and the panel drops its UART for the whole boot. One stray `0x91` byte arrives during the blackout (unidentified). |
 | `getv` | — | 🔍 inferred from the firmware code, not tested | Likely gets a value with an explicit type/format conversion (complements `get`/`gets`). |
 | `draw` | x, y, x2, y2, color | ✅ tested on this screen | Draws a rectangle outline. |
-| `covx` | — | 🔍 inferred from the firmware code, not tested | Likely an extended variant of `cov` (type conversion) with more options. |
-| `play` | id | 🔍 inferred from the firmware code, not tested | Likely plays a WAV resource by id (the firmware decodes `RIFF`/`data` WAV chunks). |
+| `covx` | — | 🔍+📕 not tested | Extended variant of `cov` (type conversion). Vendor manual (📕) gives the full form: `covx att1,att2,lenth,format` — `format` declares the numeric type (0 decimal, 1 currency, 2 hex); `lenth` is the string length (0 = auto; always the string side: the target when number→string, the source when string→number). Same-type source/target fails. So 4 operands, not 0. |
+| `play` | id | 🔍+📕 not tested | Likely plays a WAV resource (the firmware decodes `RIFF`/`data` WAV chunks). The vendor manual (📕, tagged X3/X5-only) gives `play ch,audio,loop` — audio channel, audio resource id, loop flag; playback is global across pages (keeps playing through page jumps), paused/resumed/stopped via the `audio0`/`audio1` system variables. Which of the 1- vs 3-operand form this build accepts is untested. |
 
 ### System variables (`get`/write-by-name)
 
 | Name | Description |
 |---|---|
-| `BLACK` | Colour constant BLACK. |
-| `BLUE` | Colour constant BLUE. |
-| `BROWN` | Colour constant BROWN. |
-| `GRAY` | Colour constant GRAY. |
-| `GREEN` | Colour constant GREEN. |
-| `RED` | Colour constant RED. |
-| `WHITE` | Colour constant WHITE. |
-| `YELLOW` | Colour constant YELLOW. |
+| `BLACK` | Colour constant BLACK (= 0, 📕). |
+| `BLUE` | Colour constant BLUE (= 31, 📕). |
+| `BROWN` | Colour constant BROWN (= 48192, renders as orange, 📕). |
+| `GRAY` | Colour constant GRAY (= 33840, 📕). |
+| `GREEN` | Colour constant GREEN (= 2016, 📕). |
+| `RED` | Colour constant RED (= 63488, 📕). |
+| `WHITE` | Colour constant WHITE (= 65535, 📕). |
+| `YELLOW` | Colour constant YELLOW (= 65504, 📕). |
+| `addr` | Device address for multi-screen serial buses (id 0x1A, 📕): valid 256–2815 (0x0100–0x0AFF), 0 = no address, 65535 = broadcast; saved across power-down; a configured `addr=256` prefixes commands with the 2-byte little-endian address `0x00 0x01`. In this firmware's table; functional use on this standalone screen untested. |
+| `aph` | Not decoded (id 0x1D in the firmware table; not in the 📕 variable list). |
 | `appid` | Project/application id. |
 | `audio0` | Audio device selector. |
 | `audio1` | Audio device selector. |
 | `baud` | Current baud rate (temporary; see `bauds` and the hidden `setbaudz` for the power-on default). |
 | `bauds` | Default power-on baud rate. |
+| `bcpu` | Not decoded (id 0x1E in the firmware table; not in the 📕 variable list). |
 | `bkcmd` | Which serial command results are returned: 0 none, 1 success only, 2 failure only (power-on default), 3 both. Confirmed: `bkcmd=3` is what we use for readable replies while testing. |
 | `crcval` | Holds the last value computed by the `crcput*` family. |
 | `delay` | Delay in milliseconds (a script-language statement, not a variable to read). |
 | `dim` | Current backlight brightness. |
 | `dims` | Default power-on backlight brightness. |
 | `dp` | Current page id. Gettable (numeric reply `0x71`). The power-on default page reads `0` (the stock splash is page 0x00, not 0x01); `page 1` → `dp` 1, `page 2` → 2. A clean reset marker: set it, `rest`, read it back. |
+| `eq0`–`eq9` | Independent-frequency-point audio EQ (📕, audio hardware): eq0@31 … eq9@16000 Hz; value 0–15 (0–6 attenuation, 7 flat, 8–15 boost). |
+| `eqh`, `eql`, `eqm` | Audio EQ treble / bass / mid (📕, same 0–15 scale): editing them is equivalent to editing eq0-2 / eq3-6 / eq7-9, but editing eq0-9 does not update them. |
 | `pio0` | GPIO pin 0. |
 | `pio1` | GPIO pin 1. |
 | `pio2` | GPIO pin 2. |
@@ -227,7 +319,7 @@ function `cmd_<name>`).
 | `pwm7` | PWM duty cycle, IO7. |
 | `pwmf` | PWM output frequency. |
 | `rand` | A random number (range set by `randset`). |
-| `recmod` | Recording mode. |
+| `recmod` | Serial parse mode (📕): 0 = passive (power-on default; serial commands execute normally), 1 = active parse mode — **no serial command is executed at all** (editor code in events still runs); all serial bytes sit in the receive buffer for firmware code to read (`usize`/`u[]`/`ucopy`/`udelete`, only a timer control can drive the parse, ≥ 50 ms). Exit via `recmod=0` from editor code, or over serial via the 24-byte password (see "Independent corroboration" below). |
 | `rtc0` | RTC year. |
 | `rtc1` | RTC month. |
 | `rtc2` | RTC day. |
@@ -238,14 +330,14 @@ function `cmd_<name>`).
 | `runmod` | Run mode (also settable as a top-level `runmod=0/1/2` command, see below). |
 | `scache` | Screen/surface cache setting. |
 | `sendxy` | Confirmed, used throughout this project. Real-time touch reporting (0 off, 1 on): emits `0x67` (normal) or `0x68` ("sleep" touch) frames `state xh xl yh yl` on press/release; **the release frame repeats the press's coordinates**, it does not report where the finger lifted off. Movement while held is not reported this way — poll the `tch0`/`tch1` system variables instead (see below). |
-| `sleep` | Sleep state (write 0 to sleep, 1 to wake). |
+| `sleep` | Sleep state. ⚠️ The note here previously said "0 to sleep, 1 to wake"; the vendor manual (📕) states the **opposite**: `sleep=1` enters sleep, `sleep=0` exits (in sleep only `get`/`prints`/`printh` run, plus `sleep`/`wup` assignments and host-editor connections). Verify on hardware before relying on either convention. |
 | `spax` | Horizontal character spacing (0 at power-on). |
 | `spay` | Vertical character spacing (0 at power-on). |
 | `sya0` | Not decoded. |
 | `sya1` | Not decoded. |
-| `sys0` | Built-in general-purpose numeric variable (signed 32-bit). |
-| `sys1` | Built-in general-purpose numeric variable (signed 32-bit). |
-| `sys2` | Built-in general-purpose numeric variable (signed 32-bit). |
+| `sys0` | ⚠️ Vendor manual (📕) documents `sys0–2` as built-in general-purpose numeric variables (signed 32-bit), but **this firmware has no `sysN` in its variable tables or anywhere in the binary** — treat as absent here until proven otherwise. |
+| `sys1` | ⚠️ See `sys0`. |
+| `sys2` | ⚠️ See `sys0`. |
 | `tch0` | Confirmed. Live X coordinate of the finger while touching (0 when nothing touches the panel); poll it between `sendxy` press and release to follow a drag (about 30 updates/second on this screen). |
 | `tch1` | Confirmed. Live Y coordinate of the finger while touching, see `tch0`. |
 | `tch2` | X coordinate of the start of the current touch (press point). |
@@ -255,10 +347,12 @@ function `cmd_<name>`).
 | `thsp` | Auto-sleep timeout with no touch activity. |
 | `thup` | Touch-wake switch while asleep (0 off, 1 on). |
 | `tpdir` | Touch panel orientation. |
+| `tprc6` | Not decoded (id 0x26 in the firmware table; not in the 📕 variable list). |
 | `usize` | **Resolved 2026-10-22, TJC wiki (`doc/tjcwiki/advanced`):** read-only, bytes currently buffered in the serial **receive ring** — confirms `ucopy`/`udelete`/`crcputu`, and **refutes** the old "1024-byte user storage" guess (that's `repo`/`wepo`/`rept`). Buffer is **1024 B on T0/T1/K0, 4096 on X-series** — ours is X-series (the 4096-byte `twfile` chunking matches). Polled from a **Timer tick** (`if(usize>1){...}`) in production code (🧩, nspanel); TJC has no "serial received" callback, so timer polling is the standard workaround. |
 | `ussp` | Auto-sleep timeout with no serial activity. |
+| `usup` | Serial-data auto-wake while asleep (id 0x19, 📕): 0 = off (power-on default), 1 = any serial data wakes immediately; needs `sleep=0` first. In this firmware's table; untested here. |
 | `volume` | Audio volume. |
-| `wup` | Page-refresh behaviour after waking from sleep. |
+| `wup` | Page to refresh after waking from sleep (📕): `wup=255` = the page before sleep (default); any other value = that page; assignable even while the device is asleep. |
 
 ### Hidden functions (reached only via `sets "name: args"` / `gets "name"`, 36 entries)
 
@@ -270,9 +364,9 @@ function `cmd_<name>`).
 | `aacom` | Takes one character argument (`'1'` vs anything else) into `sub_19A80`; purpose not pinned down. |
 | `registered` | Returns the device’s registration/license status (`dataModel::sub_21214`); related to `getpassw` and the `HMISETPASSWORD15` provisioning command (see `sovol/flash_layout.md`). |
 | `systime` | Returns an internal time/uptime counter (`dword_761E6C`). **Not gettable**: `get systime` → `0x1a` invalid variable name; not usable as a reset marker (`dp` is). |
-| `rprint` | Prints a variable’s value through whichever port `umport`/`printport` currently selects. |
-| `uwritef` | Writes N bytes (read via the flash-gated `freadr` path) out the selected port, one encoding. |
-| `uwriter` | Same as `uwritef` with a different (raw, not reformatted) encoding. |
+| `rprint` | ⚠️ decompiled: `rprint <var>,<n>` resolves `n` bytes of the variable through `eeprom_rw_15efa`, and if non-empty sends that buffer out `*gpUartB`'s `+0x18` slot (the `printport`-selected object, see the output-ports section) — a raw byte dump of a buffer variable, unlike `print`'s value formatting. The block carries no `g_send_locked` check of its own. |
+| `uwritef` | ⚠️ decompiled: writes the `freadr`-gated flash bytes out `*gpUartA` (the `umport`-selected object) in 0x80-byte chunks via `UART::uwrite_common`. One of the two chunked `*gpUartA` writers in `cmd_grp0_exec`. |
+| `uwriter` | ⚠️ decompiled: the second of the two chunked `*gpUartA` `uwrite_common` writers (same mechanism as `uwritef`, a different encoding/argument path); which of the two is which is not pinned. |
 | `freadr` | Reads object-attribute data from the SPI flash, but only from offsets at or above a movable floor (`dword_761EBC`, raised by `eepflash`) — below the floor it always returns 0, so the firmware/bootloader region cannot be read back this way once the floor is set past it. |
 | `floadr` | Loads a chunk of object-attribute flash data into a buffer in one call (`sub_287AC`), the bulk counterpart of `freadr`. |
 | `mwatchc` | Registers a change-callback on a variable (`sub_17510`) — continuous telemetry: the firmware calls back whenever the watched value changes. |
@@ -296,10 +390,60 @@ function `cmd_<name>`).
 | `iobeep` | (`iobeep 300` -> `invalid instruction` on hardware, syntax unknown.) Pulses the physical buzzer pin directly for a configured duration, gated by a hardware-presence flag (`byte_761EC2`) — the IO-level counterpart of the `beep` instruction, which goes through the audio engine. |
 | `tuptime` | Reads/accumulates a total-up-time counter (`dword_761EEC`). |
 | `eepflash` | Raises the floor below which `freadr` always returns 0 (a write only takes effect if `value >= dword_761EDC` or `value == 0`, so you can only raise the floor, never lower it past the current content’s own floor); `eepflash=0` disables all reads through `freadr`. This is what stops a `.tft`/firmware read-back from going below the first resource record. Not sent to the screen ourselves, only analysed. |
-| `uart2` | Enables a second UART (its own 4096-byte buffer and callback handlers, `sub_2D094`/`sub_2CDA0`/`sub_20AF8`) or disables it (`sub_20AD0`) if the argument is 0 — a second serial channel, separate from the one carrying this whole command protocol. Which physical pins it uses is not known from the decompiled firmware alone. |
-| `umport` | Selects which port (`uart2` vs the primary UART) subsequent `uwritef`/`uwriter` target. |
-| `printport` | Selects which port subsequent `print`/`rprint`-family output goes to. |
+| `uart2` | ⚠️ decompiled: argument `0` disables the second UART (`uart_recv_packet`); any non-zero `N` rebuilds `g_uart2` (`sub_2D094` ctor, `sub_2CDA0` 0x4000-byte RX buffer) and calls `uart_check_ready(N)`, which starts UART5's clock and sets its baud from `N`. This is the second serial channel, physically distinct from the primary host wire (UART2). |
+| `umport` | ⚠️ decompiled: `N≠2` → `*gpUartA = &g_uart1` (the primary/host UART), `N==2` → `&g_uart2` (UART5). Selects the target object of the `u` family (`uwritef`/`uwriter`, the raw `repo`/`rept` read-back, `crcputu`, `udelete`). Never written at boot, so the first `u`-family use after power-on goes to an uninitialized target until this is sent. |
+| `printport` | ⚠️ decompiled: `N≠2` → `*gpUartB = &g_uart1` (primary/host UART2), `N==2` → `&g_uart2` (UART5). Selects the target object of the `print`/`prints`/`printh`/`rprint` family. Never written at boot, so **send `sets "printport: 1"` first** to route print output onto the host wire (see the output-ports section). |
 | `mlen` | Sets a byte (`byte_761EA2`) controlling some length/limit; not pinned down. |
+
+## Official vendor manual (📕)
+
+[`tjc_official.md`](tjc_official.md) is a complete English translation of the vendor's serial-HMI manual
+(`ext/similar_projects/TJC-firmware-reverse-engineering/tjc_help.md`, originally in Chinese). It is the generic
+product-line reference for the same command family: in addition to the commands above it documents the on-screen
+scripting language, the full return-code family (§5), and the low-level protocols (active parse, the download
+sequence, command CRC, `twfile` chunking; §7). Its "X3/X5 series only" tags refer to the vendor's own product lines;
+where it conflicts with a finding on this build, this build wins. Knowledge from it that the tables above did not
+carry:
+
+* **The scripting language is editor-only.** `if`/`while`/`for`, assignments, and arithmetic can only be written into
+  a control's event in the editor — logic statements **cannot be sent over serial** (only plain assignments and the
+  serial instruction set can). Arithmetic evaluates strictly left-to-right: **no operator precedence, no
+  parentheses**. Numeric variables: `+ - * / % & | ^ << >>` plus `++`/`--`/`+=` and friends; string variables: `+`
+  concatenates (string + string only), `-` *deletes* N characters (`t0.txt = t0.txt - 1` drops the last character).
+  `while`/`for` freeze the screen refresh until the loop ends (or a `doevents` in the body yields per iteration);
+  serial commands are buffered but not executed during a loop.
+* **Cross-page access**: `[page].[obj].[attr]` (e.g. `main.t0.txt = "123"`, reads the same form); the target control's
+  `vscope` must be *global* (default is private) or the access fails.
+* **Name groups** (address a control by ID when its name is unknown): `b[5].txt = "123"` (control on the current
+  page), `p[2].b[4].txt = "456"` (control on a page); the indices may be numeric variables.
+* **Active parse mode (`recmod=1`)**: all serial input is stored in the receive buffer and no serial command runs
+  (editor code in events still executes; only a timer control can drive the parse, minimum interval 50 ms). Firmware
+  code reads the buffer: `usize` = bytes buffered, `u[0..usize-1]` = the bytes, `ucopy att,src,len,dest` copies
+  (`len` bytes from buffer offset `src` into variable `att` at offset `dest`; numeric variables are 4 bytes — zero
+  the variable first when copying fewer than 4), `udelete n` drops the first `n` bytes (prefer it over `code_c`,
+  which discards not-yet-read data). Exit from active mode: `recmod=0` from editor code, or the 24-byte serial
+  password `DRAKJHSUYDGBNCJHGJKSHBDN` + `FF FF FF` (see the corroboration section below).
+* **This build's tables have no `add`.** The vendor manual lists `add objid,ch,val` (single-point curve append,
+  8-bit values, up to 4 curve controls × 4 channels per page) next to `addt`/`cle`; the 53/41 tables here contain
+  only the batched `addt` and `cle` — continuous curve data on this screen goes through `addt` passthrough only.
+* **Vendor variable list vs. this firmware's tables** (both cross-checked):
+  - `addr` (0x1A) and `usup` (0x19) **do exist** in this build's `strings59` — settable here even though the screen
+    is a standalone product (details in the table above); untested functionally.
+  - The manual's `sys0–2` general-purpose numeric variables are **absent** — not in the name tables, no `sysN`
+    string anywhere in the binary, and the resolver (`sub_1E248`) has no sys branch. The manual's scripting
+    examples use them throughout; avoid them on this screen (numbered `n0…` controls fill that role).
+  - Variables present in the firmware but **not documented by the manual**: `aph` (0x1D), `bcpu` (0x1E),
+    `tprc6` (0x26), `sya0/1` (0x03/0x04) — undecoded, see table.
+* **Download handshake** (the vendor sequence in §7.2): send `connect` (+ `FF FF FF`) and read `comok ...`
+  (field meanings in the base protocol above), then `whmi-wri filesize,baud,res0`; after ~250 ms the device answers
+  a single-byte `0x05` (no terminator) and the `.tft` streams in 4096-byte chunks, each acked `0x05` — exactly the
+  framing already confirmed on this screen (the manual's `res0` is our `X`). The official open-source downloader is
+  `TFTFileDownload`.
+* **Command CRC** (vendor §7.3–7.4): an optional per-command CRC16/MODBUS by changing the terminator to
+  `FE FE FE` and inserting 2 CRC bytes (little-endian) + a `0x01` constant between the command and the terminator;
+  a bad CRC returns `0x09`. The `crcrest`/`crcputs`/`crcputh`/`crcputu` family (already reverse-engineered above)
+  is the in-firmware way to build the same checksums on script data or the active-parse buffer, with the result in
+  `crcval` (e.g. `prints crcval,2`).
 
 ## Independent corroboration from another project
 
@@ -322,8 +466,16 @@ protocol — useful once a live UI is being built, working around the display's 
 tendency to wrap text wider than its box.
 
 Their full write-up (`ext/similar_projects/ender-pearl-display/SIMILARITY_REPORT.md`) compares this screen's
-`TJC4827X243_011C` (800x480, runtime 159, 16 MB flash) against Ender Pearl's `TJC3224T132_011N` (240x320, runtime 68,
+`TJC4827X243_011C` (480×272, runtime 159, 16 MB flash) against Ender Pearl's `TJC3224T132_011N` (240x320, runtime 68,
 8 MB flash): same protocol family, opposite execution (external Pi draws on a TJC display SoC vs. a full bootloader on
 this screen's own SoC). Every model/resolution/flash/baud number in their docs is for the other model and must not be
 copied.
+
+A second independent source, `ext/similar_projects/TJC-firmware-reverse-engineering/` (same `TJC3224T132_011N`
+family, a different unit), implements the same "upload protocol v1.2" — `connect` → `comok` → `whmi-wris
+<size>,<baud>,1` — and its observation of the `0x08` + offset first-block ack on that panel corroborates the
+`whmi-wris` resume behaviour decompiled above (the `.tft`-format findings it contributes are in `flash_layout.md`).
+⚠️ Its panel additionally speaks the DWIN T5L **binary frame** protocol (`dwin_protocol.py`,
+`AA <instr> <data> CC 33 C3 3C`) — a different protocol family that does not apply to this `_011C` screen; the two
+DWIN vendor PDFs shipped in that repo are for that family, not for TJC serial.
 

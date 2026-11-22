@@ -4,12 +4,15 @@ Proof-ladder rung, C variant: **poked-into-SDRAM code runs on the live panel and
 beeps its TIM5 buzzer.** The 300-byte blob (compiled from `buzz_blob.c`: the same
 `entry` + "ta-daa" melody as the asm sibling) is poked into the SDRAM arena at
 `0x650000` on an already-running panel (no boot / power cycle), then executed
-with `fun0 0x650001` (Thumb `blx`). All linked addresses are self-consistent at
+with the nana `fun` command (`fun 0x650001` - Thumb `blx`, the 1 bit set). All
+linked addresses are self-consistent at
 `0x650000`; `entry` needs only a valid SP and returns via its own C epilogue
 (`pop {r4,r5,pc}` ≡ `bx lr`).
 
-Companion to `../poke-and-run.asm/` — identical driver scripts and blob contract,
-only the blob source and build differ (C vs hand-written assembly).
+Companion to `../poke-and-run.asm/` — same flow and blob contract, only the blob
+source and build differ (C vs hand-written assembly). Note: the .asm sibling's
+scripts still use the old text `fun0` flow and the old blob-head fingerprint -
+stale after the 2026-11-21 binary-only restructure (left as-is on purpose).
 
 ## Files
 
@@ -30,9 +33,10 @@ only the blob source and build differ (C vs hand-written assembly).
   off otherwise), the `LIVE_HEAD` blob-head constant, and `check_live` (every
   driver starts with this blob-head liveness peek).
 - `run.sh` — the whole flow: liveness → pre-poke 8 B dump →
-  `poke 0x650000 @buzz_blob.bin` (2×255 B chunks) → fresh-console 300-byte
-  readback `cmp`'d against the blob (≤2 attempts) → `fun0 0x650001` (expect the
-  `0x5A` ack) → post liveness re-check. Panel I/O only via
+  `poke 0x650000 @buzz_blob.bin` (300 B < the 4045 poke cap - one nana request)
+  → fresh-console 300-byte readback `cmp`'d against the blob (≤2 attempts) →
+  `fun 0x650001` over the shell REPL (expect `fun 0x00650001: ok`) → post
+  liveness re-check. Panel I/O only via
   `tools/screen_probe.py` (no `--port`; the port comes from `PANEL_PORT`).
 - `verify.sh` — independent readback of the TIM5 register block + the SYS
   clock/reset/pin registers, decoded to a fingerprint verdict: a completed
@@ -63,21 +67,18 @@ make -C snippets/poke-and-run.c run
 make -C snippets/poke-and-run.c verify
 ```
 
-`run.sh` exit codes: 0 = ok, 1 = a step failed (poke not verifiable, no `0x5A`
-ack, or panel not live after the blx — the last one may mean the panel hung;
-recovery is a power cycle), 2 = environment (no `PANEL_PORT`, missing/stale
-blob). `verify.sh` exits 1 if any register read comes back empty.
+`run.sh` exit codes: 0 = ok, 1 = a step failed (poke not verifiable, no
+`fun ... ok` reply, or panel not live after the blx — the last one may mean the
+panel hung; recovery is a power cycle), 2 = environment (no `PANEL_PORT`,
+missing/stale blob). `verify.sh` exits 1 if any register read comes back empty.
 
-## Status (2026-11-16)
+## Status
 
-C port of the asm snippet; the blob is byte-for-byte functionally equivalent
-(same register-write sequence, same 3-note "ta-daa" melody, same terminator).
-Built 300 B (252 B `.text` + 48 B `.rodata` melody), no undefined refs, Thumb
-first byte, `pop {r4,r5,pc}` epilogue — layout verified on the ELF.
-
-**Not yet poked to the panel.** The open question inherited from the asm
-snippet (2026-11-15) stands: the blob `blx`'d cleanly (`0x5A` ack, panel live)
-but the melody was not audible — the `fun0` ack returned in 0.010 s where a
-full run should take ~0.67 s, i.e. the TIM5 clock/reset gates may not be
-effective. `verify.sh`'s fingerprint is the discriminator; run it on both
-snippets and compare.
+Retracted: the "D-cache coherency bug" analysis (2026-11-18) was wrong. The
+poke-and-run `blx` failures (2026-11-17/18) were the console blob's broken
+`0x` prefix parse: `fun0 0x650001` parsed as `fun0 0` -> `blx 0` -> HardFault.
+The text parser was fixed (`pb_hex`), and on 2026-11-21 the console went
+binary-only - the text grammar (and `pb_hex`) is gone, and this flow now uses
+the nana `fun` command (the scripts' old `raw fun0 ... + 0x5A`-ack grep and the
+blob-head fingerprint in `common.sh` were updated to match). Unverified on the
+current blob since 2026-11-18.

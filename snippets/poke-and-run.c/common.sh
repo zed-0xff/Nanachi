@@ -17,7 +17,7 @@ BLOB="$HERE/buzz_blob.bin"
 
 # The console blob head at the PEEK_BLOB_DST gap (0x79D448): present when the
 # stage-0 image with the 0x2A1E console blob is running.
-LIVE_HEAD="ffb55a2000f05af8"
+LIVE_HEAD="ffb5632000f039f8"  # push {r0-r7,lr} + movs r0, #'c' + bl pk_marker (the "chi!" console entry)
 
 probe() { python3 "$PROBE" "$@"; }
 

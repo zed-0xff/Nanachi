@@ -99,6 +99,78 @@ The record checksum (`dataModel::read`) includes the chip's serial number, so a 
 * The screen version text lives on page 53 as plain text (`1.0.8` in this file, `V1.5.2` / `V1.0.7` in the Comgrow one); the host
   overwrites it (`curVersion` / `newVersion`). The header has only `file_version = 33` (the format) and the editor version.
 
+### Internals of the `.tft`
+
+Both headers are 0xC8 bytes: a data area, 0xFF padding, and a 4-byte CRC at the end (`0xC4-0xC7` = header 1,
+`0x18C-0x18F` = header 2). The complete field lists are in `TFTTool.py` (`_fileHeader1` / `_fileHeader2`, which also
+decode this file); the fields that matter here:
+
+* **Header 1** — `model_crc` at `0x2E-0x31` (a checksum of the model name; here `0x38A388A8`), `file_version` at
+  `0x32` (33 in this file), `model_series` at `0x15` (the checksum-variant selector, below), `ui_orientation` at `0x14`,
+  resolution at `0x0C-0x13`, and the resource block at `0x34-0x47` in the order `ressources_files_address` (0x34) /
+  `ressources_files_count` (0x38, 12 here) / `file_size` (0x3C, the total file length) / `ressource_files_size` (0x40) /
+  `ressource_files_crc` (0x44, the resource region's checksum).
+* **Header 2** — the addresses/sizes of every section (static usercode, app attributes data, pages, objects, pictures,
+  fonts). Its body is XORed with a *repeating* 4-byte key derived from header 1:
+  `key = CRC(model_crc as a little endian dword, salt = CRC(b"A678ert"))`, both with the chip CRC unit's byte
+  checksum (`Checksum.CRC`); here `0x38A388A8 → 0xF3D2481F`. The derivation comes from the decompiled firmware
+  (`sub_18A38` / `xor_sub`, AiHmiT7 fw159) and from the editor (`Appfree10`, `HMI/hmitype/Kuozhan.cs`, seed
+  `datasize.apppasseord`); TFTTool reproduces it for 51 of 60 known models and decodes this file with it (its
+  consistency checks pass). Older F/T series models have key `0` (header 2 not encoded at all). (The RE repo's
+  `TJC3224` file resisted their key-reading trick and they called the stream "position dependent"; it is a repeating
+  4-byte XOR after all.)
+* **The four checksums** — one algorithm family: CRC-32, poly `0x04C11DB7`, MSB first, register starts at `0`, no
+  final XOR; each input byte is fed in as a full 32-bit word (24 zero bits, then the 8 data bits), the first word is
+  XORed with `0xFFFFFFFF`, and 32 zero bits are appended at the end.
+
+  | Field | Stored at | Covers |
+  |---|---|---|
+  | header 1 | `0xC4` | header 1 without its own CRC |
+  | header 2 | `0x18C` | the XORed header 2 body |
+  | resources | `0x44` (header 1) | the resource region (`ressources_files_address` .. +`ressource_files_size`; here `0x20000-0x89FFFF`) |
+  | file | last 4 bytes | the whole file minus the last 4 bytes; the stored low byte is XORed with header 1 bytes `0x03 ^ 0x2E ^ 0x3C` |
+
+  The input variant is chosen by header 1's `model_series`: series 0/1/100 use the widened-byte form above for all
+  four; series 2/3/4 feed the resources and file checksums 32-bit little endian words instead (the two header
+  checksums stay widened). This screen is **series 4** — TFTTool's model table (`0x38A388A8 → "unknown 480x272
+  series-4 (Sovol SV08 Max)"`) and the word-wise running checksum of the decompiled upload path both point to it.
+  Two independent implementations of the widened variant (TFTTool `Checksum.CRC_fast` and the RE repo's
+  `tjc_checksums.crc`) produce identical values; all four fields verify on this dump (previous session, at the exact
+  file length), on the RE repo's `TJC3224T132` file (a series-100 / T1 file, widened variant), and on a real
+  series-4 file — `QIDI_PLUS3/UI/800_480_PLUS.tft`
+  (21 365 856 B, `model_crc 0x7527dcfa`, series 4) — with the word-based resources/file variant.
+* **The section table** at `0x10000` ("bootloader header"): 12 entries × 12 bytes (`rel_offset` | `size` | `meta`,
+  relative to `0x10000`) naming the parts that follow: embedded runtime components, the resource region, the user
+  code. In the RE repo's `TJC3224T132` file nine entries are used: `input.bin` (17 570 B), two unnamed blobs,
+  `qr0.bin` (1 850 B), `syscom.bin` (1 556 B), two unnamed, **Resources** (7 104 219 B, the largest entry — it
+  points at the resource/image *table*, not the first picture), and **User code** (54 289 B). `syscom.bin` is not a
+  bootloader but the HMI runtime *interpreter*; it carries the strings the panel shows on update problems
+  (`Data ERROR!`, `Model does not match`, `The Resource file Resolution is not Fit!`, `Touch Just`,
+  `Flash Write Error...` — the same set this screen's own firmware has). ⚠️ names/roles from that file; in this
+  dump entries 5 and 6 (`0x7B9000`) hold Thumb/ARM plugin code XORed with `0xB0` (an earlier session).
+* **Pictures** — the resource region starts with a table of 24-byte records (magic `0x0301600A`/`0x0301640A`
+  (`0x0401600A` in newer files), `id`, offset relative to the table, `w:u16`, `h:u16`, `size:u32`, `0`), then the
+  picture data — here 117 pictures at `0x284730` (2 226 476 bytes) — then the 4 fonts (⚠️ stored as copies of the
+  editor's `.zi` font files). After a 20-byte picture prefix (byte 0 = flag `0x00` raw / `0x04` compressed; bytes
+  4-7 = the used length; the table's `size` may carry trailing padding) a picture is one of three formats
+  (TFTTool `decodePicture`; all 117 of this file decode — the pixel comparison with the Comgrow file above used
+  them): **0** = raw little-endian RGB565 (small pictures: plus a further 20 zero bytes); **1** = run-block RLE —
+  20-byte blocks of 4 control bytes + 8 LE RGB565 pixels; a control field of exactly `1F 11 11 11` is literal (the
+  8 pixels are emitted once each), otherwise each control byte splits into two nibbles (low first) giving 8 repeat
+  counts, one per pixel, `0` = emit nothing; the encoder aligns every 4 output rows to a block boundary (⚠️ the
+  invariant the RE repo verified on all 1994 of its resources); **2** = palette-coded — `w:u32 h:u32 magic
+  0x05DDC33C stream-length:u32`, then palette segments (`<0x0000> <n:u16> <bits:u8 1-7> <n × RGB565> <mask>` with
+  packed index/run bytes, a DWIN-style scheme).
+* **User code** (`0x8A0000`) — not machine code: length-prefixed bytecode blocks the `syscom` interpreter
+  executes. List operators are `0x09 <index> 0x04|0x08` (the index and the name-length byte are series-specific;
+  TFTTool's tables for series 3/4, editors 1.65.x-1.67.x, are verified against real projects and decode this file),
+  arithmetic operators are their ASCII codes (`= 0x3D`, `+= 2B 3D`), `jmp` is `54 20`, and the conditional jump
+  (`cjmp`, official name `i`) is a fixed 3-byte operator with four comma-separated operands (it jumps when the
+  comparison is *false* — if/else, for, while are built from it). Operands carry a type prefix (none = string,
+  `01` local variable, `03` int value, `04` system variable, `05` global variable; the last two are 4-byte offsets
+  into the variable data blocks). The page list names each page by the byte-checksum of its zero-padded 14-byte
+  name, and the program section always ends with an unreachable `page 0` block.
+
 ## How to get the pieces out
 
 ```
@@ -139,6 +211,20 @@ See also: firmware patch sites), [porting.md](porting.md) (boot chain, app start
 `whmi-wri` path hits (patch a picture → uploads fine → boots to "System Data ERROR!" because three 4-byte checksum
 fields change with any pixel and none is a standard CRC32). They deliberately did not reverse the checksums and rebuild
 in the editor instead — the same choice as here; see `docs/03-custom-firmware.md`. Their `SIMILARITY_REPORT.md` compares
-this `TJC4827X243_011C` (800x480, runtime 159, 16 MB) against their `TJC3224T132_011N` (240x320, runtime 68, 8 MB):
+this `TJC4827X243_011C` (480×272, runtime 159, 16 MB) against their `TJC3224T132_011N` (240x320, runtime 68, 8 MB):
 same protocol family, opposite execution. Read `docs/04-drawing.md` for the design technique (3× wallpapers, `xpic`
 panel crops, `xstr sta=0` text) that works around the display's inability to blur at runtime.
+
+## External reference: TJC firmware reverse-engineering repo
+
+`ext/similar_projects/TJC-firmware-reverse-engineering/` — a different panel (`TJC3224T132_011N`, 240×320,
+Creality Ender-3 V3 SE, kernel v37 / MCU 61760), but the richest independent source on the `.tft` format and the
+upload protocol. What it contributes here: the four-CRC table and its `crc()` implementation (identical to TFTTool's,
+verified in the `.tft` section above), the 12-entry section table at `0x10000` and the `syscom.bin` interpreter, the
+run-block RLE picture format (its `tjc_decompress.py` / `tjc_compress.py`), and a working uploader of the
+"upload protocol v1.2" (`tjc_serial_upload.py`) that observed the `whmi-wris` skip-ahead (`0x08` + offset) on its
+panel. Facts from it that do **not** transfer to this screen: the DWIN T5L binary frame protocol its panel also
+speaks (`dwin_protocol.py`, `AA <instr> <data> CC 33 C3 3C` — a different protocol family; this screen is the
+text-protocol `_011C`), and its own resolution / flash / kernel numbers. The two DWIN vendor PDFs in the same folder
+(`T5L_TA-Instruction-Set-Development-Guide.pdf`, `T5UIC1.Kernel.Application.Guide-en-v1.2.pdf`) belong to the DWIN
+family and are not applicable here.

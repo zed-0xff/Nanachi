@@ -10,9 +10,9 @@ Answers the questions that decide whether KlipperScreen can run on the stock scr
   recover     the screen is silent after a baud change: soft-reset, then send baud=115200 at every rate
   raw     send any command, print every reply
   peek    read panel memory as a hex dump; -w FILE saves the binary dump (needs the stage1 image's peek blob running)
-  poke    write panel memory: 1-255 bytes of hex, or a whole file as @file in 255-byte chunks (needs the stage1 image's poke blob running)
-  shot    screenshot of the live framebuffer 0x60EC00 (480x272 RGB565, one 261120-byte peek): PNG by default, --raw saves it as-is
-  shell   one console open, then a peek/poke/raw REPL on the same link (the slow comok is paid once, not per command)
+  poke    write panel memory: hex, or a whole file as @file (the host chunks at 4045 bytes per nana request; needs the stage1 image's poke blob running)
+  shot    screenshot of the live framebuffer 0x60EC00 (480x272 RGB565, 261120 bytes in chunked peeks): PNG by default, --raw saves it as-is
+  shell   one console open, then a peek/poke/fun/fur/raw REPL on the same link (the slow comok is paid once, not per command)
   bench   draw command throughput at 115200 and (--fast 921600) at a higher baud rate
   flash   write a .tft with `whmi-wri` (what Sovol's `uart` does), only after the .tft checksums verified
 
@@ -34,6 +34,7 @@ import os
 import struct
 import sys
 import time
+import zlib
 
 try:
     from .iac import IacSerial          # imported as tools.screen_probe
@@ -42,8 +43,19 @@ except ImportError:
 
 BAUDS = [115200, 921600, 9600, 230400, 460800, 57600, 38400, 19200, 4800, 2400]
 END = b"\xff\xff\xff"
-POKE_MAX = 255          # the stage1 blob's poke N cap; file pokes chunk to this
-PEEK_MAX = 32768        # the stage1 blob's peek N cap: a single peek delivers at most ~33000 bytes, so dumps larger than this must be chunked
+# One nana request line must fit the stock's committed RX frame: the frame reader drops the
+# frame (a full silent ring reset) when the committed [u16 len][line] would reach the 4096-byte
+# ring end, and the flush re-anchors the ring when the frame would run past the 30-byte tail
+# margin - so the line length is <= 4064 bytes. A nana line is 15 bytes of overhead ("nana " +
+# u32 size + u32 crc32 + " ") around [cmd][args], so the args of one request are capped at
+# 4049 bytes; a poke's args are [u32 addr][data], so its data cap is 4045 (enforced by the
+# blob; the host chunks longer pokes transparently). Peek/fun/fur args are fixed-size and
+# always fit; their reply sizes are unbounded (the reply goes out the raw TX, not through the
+# RX ring) - the host chunks a long shot at SHOT_CHUNK for transport convenience only.
+NANA_MAX_DATA = 4049                       # max args byte count of one nana request
+NANA_MAX_POKE_DATA = NANA_MAX_DATA - 4     # poke data cap (args = 4-byte addr + data)
+SHOT_CHUNK = 65535                         # shot readback chunk (a convenience, not a bound)
+
 # The live display source buffer (blit_60ec): the framebuffer the panel scans continuously,
 # 480x272 RGB565 = 261120 bytes (pbuf->fb, 1:1 verified with a camera image)
 FB_ADDR = 0x60EC00
@@ -71,6 +83,62 @@ def modbus_crc(data: bytes) -> int:
         for _ in range(8):
             crc = (crc >> 1) ^ 0xa001 if crc & 1 else crc >> 1
     return crc
+
+
+# --- nana binary protocol (1:1 raw bytes, CRC32) ---
+
+def nana_crc32(data: bytes) -> int:
+    """CRC32 (IEEE 802.3, reflected poly 0xEDB88320) - matches the blob's pb_crc32."""
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def nana_request(cmd: int, args: bytes) -> bytes:
+    """Build a nana binary request frame.
+    cmd: 1=peek, 2=poke, 3=fun, 4=fur
+    args: command-specific binary arguments
+    Wire: "nana [u32 size LE][cmd][args][u32 crc32 LE] " FF FF FF
+    The binary payload sits INSIDE the line frame (before the terminator), so the stock
+    framer's [u16 len][data] capture puts it in the RX ring where the blob reads it at
+    token_start + 5 ("nana" + the separating space). The trailing 0x20 guard byte keeps the
+    last data byte > 0x10 so uart_rx_next_frame skips its u16 checksum validation.
+    size = len(cmd+args) + 4 (the crc)."""
+    payload = bytes([cmd]) + args
+    crc = nana_crc32(payload)
+    size = len(payload) + 4
+    return b"nana " + struct.pack("<I", size) + payload + struct.pack("<I", crc) + b" " + END
+
+
+def _nana_read(s, wait=2.0):
+    """Read one nana binary reply from the screen.
+    Expected stream: "chi!" [u32 size LE][payload][u32 crc32 LE] (then optionally 0x00 FF FF FF).
+    Returns (payload_bytes, error_string_or_None)."""
+    s.ser.timeout = 0.01
+    raw = b""
+    last = time.time()
+    end = time.time() + wait
+    while time.time() < end:
+        c = s.ser.read(256)
+        if c:
+            raw += c
+            last = time.time()
+            # Try to parse the reply
+            m = raw.find(b"chi!")
+            body = raw[m + 4:] if m >= 0 else raw
+            if len(body) >= 4:
+                size = struct.unpack("<I", body[:4])[0]
+                total = 4 + size + 4  # size field + payload + crc
+                if len(body) >= total:
+                    payload = body[4:4 + size]
+                    crc_stored = struct.unpack("<I", body[4 + size:8 + size])[0]
+                    crc_calc = nana_crc32(payload)
+                    if crc_stored != crc_calc:
+                        return payload, f"CRC mismatch: stored 0x{crc_stored:08x} calc 0x{crc_calc:08x}"
+                    return payload, None
+        elif raw and time.time() - last > 0.6:
+            break
+    if not raw:
+        return b"", "no response"
+    return b"", f"incomplete reply ({len(raw)} bytes: {raw[:32].hex(' ')})"
 
 
 def twfile_packets(data: bytes, chunk: int = 4096 - 12 - 2):
@@ -190,9 +258,7 @@ class Screen:
         ``comok`` that lands between two sends is picked up on the very next read
         instead of being discarded and re-requested -- the old fixed read-windows
         could miss a ``comok`` that arrived just after a window closed, and that
-        lost window was the bulk of a slow peek. The panel opens the console on
-        its own schedule (~3.5-5 s over the ACM/ser2net path, independent of our
-        resend cadence), so that latency is the floor here, not our polling.
+        lost window was the bulk of a slow peek.
         Returns the ``comok`` frame, or every frame that arrived if none."""
         t0 = time.time()
         self.ser.reset_input_buffer()
@@ -280,85 +346,6 @@ def cmd_raw(a):
         print(cmd, "->", [parse_frame(f) for f in s.ask(cmd, a.wait)] or "no reply")
 
 
-def _peek_parse(raw: bytes, final: bool = False):
-    """Splits a peek reply into (dump data, error message or None, beacon count, junk). The stage1
-    blob answers a `peek` line with a 0x5A beacon, then dump frames 72 <n> <n data bytes> FF FF FF
-    (n = 1..254 as-is; a full 255-byte chunk sends n = 0xFE on the wire - 0xFF is reserved for the
-    4-byte error frame 72 FF FF FF; the parser decodes 0xFE back to 255), then the stock's own 00
-    invalid-instruction ack. Every frame is parsed positionally by n - no pattern scan, no lookahead
-    - so data holding 0x72/0x00/0xFF (long FF runs included) is unambiguous.
-
-    Fault modes: a complete error frame sets err ("bad syntax?"); a frame whose terminator is
-    missing where the length says it must be means bytes were lost or shifted in transit.
-    ``final`` selects the semantics of a stream that simply ends inside a frame: False =
-    "still arriving" (no err, the read loop keeps going); True = report it (truncated: the
-    partial data is placed in the dump at its true offset and err says how many of the n data
-    bytes arrived; shifted: the byte where the terminator should be is named in err and the
-    unparseable remainder goes to ``junk`` in stream order for inspection)."""
-    beacons, chunks, err, junk, i, n = 0, [], None, bytearray(), 0, len(raw)
-    while i < n:
-        b = raw[i]
-        if b == 0x5a:
-            beacons += 1
-            i += 1
-        elif b == 0x72:
-            if i + 1 >= n:
-                if final:
-                    err = f"truncated frame at {i}: 72 without a length byte"
-                    junk += raw[i:]
-                break
-            ln = raw[i + 1]
-            if ln == 0xFF:
-                # the error sentinel: a data chunk never sends 0xFF, so a 72 FF can only be this frame.
-                # A frame is COMPLETE only when its 3-byte terminator has arrived (i+4 <= n). While the
-                # terminator is still in flight (i+4 > n) this is NOT a real error yet - keep reading.
-                if i + 4 > n:
-                    if final:
-                        err = f"corrupt error frame at {i}: {raw[i:i + 4].hex(' ')}"
-                        junk += raw[i:]
-                    break
-                if raw[i + 1:i + 4] == END:
-                    err = "error frame (bad syntax?)"
-                else:
-                    err = f"corrupt error frame at {i}: {raw[i:i + 4].hex(' ')}"
-                junk += raw[i:]
-                break
-            # 0xFE on the wire means a full 255-byte chunk (the blob remaps 255 -> 0xFE so
-            # 0xFF stays the exclusive error sentinel); every other value is the byte count
-            nlen = 255 if ln == 0xFE else ln
-            j = i + 2 + nlen
-            if j + 3 <= n and raw[j:j + 3] == END:
-                chunks.append(raw[i + 2:j])
-                i = j + 3
-            elif j >= n:
-                # the stream ends before the terminator: a byte was lost in transit (final),
-                # or the panel is still sending (keep reading)
-                avail = raw[i + 2:j]
-                if avail:
-                    chunks.append(avail)      # sequential data: place it; the caller sees len(dump) < expected
-                if final:
-                    err = f"truncated frame at {i}: got {len(avail)} of {nlen} data bytes (lost in transit?)"
-                break
-            else:
-                # the terminator is not where the length says. Two cases: (a) the 255-byte
-                # frame's terminator is still in flight (the read boundary split it) - then
-                # more bytes are coming and this is NOT an error yet; (b) a byte was truly
-                # lost/shifted. We can only tell after the stream goes quiet, so: if we are
-                # still reading (final=False) just stop this parse and keep the loop going;
-                # only declare it corrupt once final=True confirms no more data is arriving.
-                if final:
-                    err = (f"corrupt frame at {i}: expected terminator after {nlen} data bytes, "
-                           f"got 0x{raw[j]:02x} (shifted stream)")
-                    junk += raw[i:]
-                break
-        elif raw[i:i + 3] == END:
-            i += 3
-        else:
-            junk += bytes([b])          # the stock's 00 ack and anything else
-            i += 1
-    return b"".join(chunks), err, beacons, bytes(junk)
-
-
 def _hexdump(base: int, data: bytes):
     for off in range(0, len(data), 16):
         row = data[off:off + 16]
@@ -399,89 +386,24 @@ def _open_console(s):
     return True
 
 
-def _peek_read(s, expected, wait):
-    """Read one peek reply, stopping deterministically as soon as ``expected`` dump
-    bytes are collected (the blob's dump is exactly ``expected`` bytes), a complete
-    error frame arrives, or the stream is detected as shifted/corrupt mid-frame; a
-    0.6 s quiet period and the ``wait`` backstop cover the cases where the panel
-    sends less than expected or the link never goes quiet. A stream that merely
-    ends inside a frame keeps reading (final=False) and is reported on the final
-    parse (final=True): truncated (bytes lost) or corrupt (terminator shifted).
-    Returns ``(dump, err, beacons, junk, raw)``."""
-    raw, last = b"", time.time()
-    s.ser.timeout = 0.01          # tight poll: a short reply is noticed within ~10 ms, not the 50 ms default
-    end = time.time() + wait
-    while time.time() < end:
-        c = s.ser.read(256)
-        if c:
-            raw += c
-            last = time.time()
-            dump, err, _, _ = _peek_parse(raw)
-            if err or len(dump) >= expected:
-                break
-        elif raw and time.time() - last > 0.6:
-            break
-    dump, err, beacons, junk = _peek_parse(raw, final=True)
-    return dump, err, beacons, junk, raw
-
-
 def _peek_run(s, addr, length, wait, verbose=False, hexdump=True):
-    """Run one peek against an already-open console and print the result (the hex
-    dump is skipped when ``hexdump`` is off - e.g. a binary save to a file wants only
-    the summary)."""
-    cmd = f"peek 0x{addr:x},{length}"
-    s.ser.reset_input_buffer()          # clear any trailing bytes from a previous command's deterministic stop
-    s.send(cmd)
-    dump, err, beacons, junk, raw = _peek_read(s, length, wait)
-    tail = bytes(b for b in junk if b != 0x00)      # the 00 invalid-instruction ack is expected after a peek
-    if beacons:
-        print(f"  (0x5A beacon x{beacons}: the peek blob ran)")
+    """Run one peek (binary nana protocol) against an already-open console and print
+    the result. The hex dump is skipped when ``hexdump`` is off."""
+    frame = nana_request(1, struct.pack("<II", addr, length))
+    s.ser.reset_input_buffer()
+    s.ser.write(frame)
+    s.ser.flush()
+    if verbose:
+        print(f"  > nana peek 0x{addr:08x} len={length}")
+    dump, err = _nana_read(s, wait)
     if err:
-        print(f"peek {cmd}: {err}")
+        print(f"peek 0x{addr:08x} len={length}: {err}")
     if dump:
         if hexdump:
             _hexdump(addr, dump)
-        print(f"  {len(dump)} bytes from 0x{addr:08x}"
-              + (f" (+{len(tail)} B partial tail)" if tail else "")
-              + (f" (shorter than the {length} requested - truncated?)" if len(dump) < length else ""))
-    if not dump and not err:
-        # A reply with no Z beacon means the stock parser answered (0x1A invalid-variable) -
-        # the blob is not installed on this boot. A Z beacon with no data means the blob ran
-        # but the window/syntax was bad. 0 bytes means the line was dropped (console not open).
-        if raw and 0x5a not in raw:
-            print(f"peek {cmd}: no Z beacon - the peek blob is not installed on this boot (stock answered)")
-        elif raw:
-            print(f"peek {cmd}: Z beacon but no dump (bad window or syntax?)")
-        else:
-            print(f"peek {cmd}: nothing received (the console dropped the line)")
-        print(f"  (raw: {len(raw)} bytes: {raw[:64].hex(' ')})" if raw else "  (raw: nothing received)")
-        if not raw:
-            # the line was never answered: probe with a known 3-char line that the 0x2A1E path
-            # handles in stock and in the blob; a Z beacon in the reply means the blob is installed
-            s.send("get dp")
-            p, last = b"", time.time()
-            pend = time.time() + 1.5
-            while time.time() < pend:
-                c = s.ser.read(256)
-                if c:
-                    p += c
-                    last = time.time()
-                elif p and time.time() - last > 0.3:
-                    break
-            if p:
-                print(f"  (probe 'get dp': {len(p)} bytes, {'blob (Z beacon)' if 0x5a in p else 'no Z (stock)'}, head {p[:24].hex(' ')})")
-            else:
-                print("  (probe 'get dp': silence — the console dropped the line)")
-    if tail:
-        if dump and hexdump:
-            # the unparseable stream after the fault point (a shifted/corrupt frame),
-            # in order; unplaced (the alignment is broken from the fault byte on), so
-            # the offset shown is a lower bound, not a map
-            print(f"  --- partial tail: {len(tail)} B (stream order; unplaced) ---")
-            _hexdump(addr + len(dump), tail)
-        else:
-            print(f"  (unparsed tail: {tail.hex(' ')})")
-    return dump, err, tail
+        if len(dump) < length:
+            print(f"  {len(dump)} bytes from 0x{addr:08x}" + f" (shorter than the {length} requested - truncated?)")
+    return dump, err, b""
 
 
 def cmd_peek(a):
@@ -530,20 +452,21 @@ def cmd_shot(a):
         return
     s.ser.timeout = 0.01
     t0 = time.time()
-    # The peek blob caps a single dump at ~33000 bytes, so the 261120-byte framebuffer
-    # must be read in PEEK_MAX-byte chunks. Each chunk is its own peek line (a fresh
-    # priming line is NOT needed - the console is already open and the parser is primed
-    # by _open_console's throwaway line; the blob answers every subsequent peek line).
+    # A peek's request args are fixed 8 bytes (addr + size) and the reply goes out the raw
+    # TX, so the chunk size is transport convenience, not a ring bound.
+    CHUNK = SHOT_CHUNK
     fb = b""
-    for off in range(0, FB_TOTAL, PEEK_MAX):
-        n = min(PEEK_MAX, FB_TOTAL - off)
+    err = None
+    for off in range(0, FB_TOTAL, CHUNK):
+        n = min(CHUNK, FB_TOTAL - off)
         s.ser.reset_input_buffer()
-        s.buf = b""
-        s.send(f"peek 0x{FB_ADDR + off:x},{n}")
-        part, err, _, _, _ = _peek_read(s, n, a.wait)
+        frame = nana_request(1, struct.pack("<II", FB_ADDR + off, n))
+        s.ser.write(frame)
+        s.ser.flush()
+        part, err = _nana_read(s, a.wait)
         fb += part
         if err or len(part) < n:
-            break      # a short/failed chunk: stop; the remainder is missing
+            break
     s.close()
     dt = time.time() - t0
     if not fb:
@@ -559,10 +482,6 @@ def cmd_shot(a):
             if a.raw:
                 f.write(fb)
             else:
-                # a truncated dump ends mid-row: cut at the last complete row before encoding.
-                # The peeked framebuffer comes back in the panel's raw scan order, which is
-                # rotated 180 deg relative to the physical screen (verified vs the camera), so
-                # rotate it back to match what is actually on the glass.
                 n = len(fb) // FB_BPP * FB_BPP
                 _rgb565(fb[:n], FB_W).rotate(180).save(f, "PNG")
     except OSError as e:
@@ -573,65 +492,62 @@ def cmd_shot(a):
 
 
 def _poke_reply(s, wait):
-    """Read one poke reply, stopping as soon as the answer is complete: the Z beacon
-    (success - the write is not echoed) or the 72 FF FF FF error frame (the 0xFF length
-    is the error sentinel; poke frames never use it for data), both arrive whole; the
-    0.6 s quiet period and the ``wait`` backstop cover the no-answer case (the line
-    never reached the blob). Returns ``(dump, err, beacons, junk)``."""
-    raw, last = b"", time.time()
-    s.ser.timeout = 0.01               # tight poll: the Z-beacon / error reply is noticed within ~10 ms
-    end = time.time() + wait
-    while time.time() < end:
-        c = s.ser.read(256)
-        if c:
-            raw += c
-            last = time.time()
-            _, err, beacons, _ = _peek_parse(raw)
-            if err or beacons:
-                break
-        elif raw and time.time() - last > 0.6:
-            break
-    return _peek_parse(raw, final=True)
+    """Read one poke reply (binary nana protocol). Returns (payload, err).
+    Success: payload is empty (size=0). Error: payload is 1 byte (0xFF)."""
+    return _nana_read(s, wait)
 
 
 def _poke_run(s, addr, value, wait, verify, verbose=False):
-    """Run one poke against an already-open console and print the result. ``value`` is
-    the bytes to write. The blob answers a success with NO frame (the Z beacon only) -
-    the write happened; an error (bad syntax / N > 255 / outside the writable windows)
-    is one 72 FF FF FF frame. _peek_parse splits both: a success is beacons with zero
-    chunks."""
-    cmd = f"poke 0x{addr:x},{len(value)},{value.hex().upper()}"
-    s.ser.reset_input_buffer()          # clear any trailing bytes from a previous command
-    s.send(cmd)
-    dump, err, beacons, junk = _poke_reply(s, wait)
-    if beacons:
-        print(f"  (0x5A beacon x{beacons}: the poke blob ran)")
-    if err:
-        print(f"poke {cmd}: {err}")
-    elif beacons and not dump:
-        print(f"poke {cmd}: ok ({len(value)} bytes to 0x{addr:08x}; no reply frame - the write is not echoed)")
+    """Run one poke (binary nana protocol) against an already-open console and print
+    the result. ``value`` is the bytes to write; data longer than the NANA_MAX_POKE_DATA
+    poke cap is chunked here, transparently, advancing the address per chunk."""
+    s.ser.reset_input_buffer()
+    if verbose:
+        print(f"  > nana poke 0x{addr:08x} len={len(value)}")
+    ok = True
+    off = 0
+    while off < len(value):
+        part = value[off:off + NANA_MAX_POKE_DATA]
+        frame = nana_request(2, struct.pack("<I", addr + off) + part)
+        s.ser.write(frame)
+        s.ser.flush()
+        dump, err = _poke_reply(s, wait)
+        if err:
+            print(f"poke 0x{addr + off:08x}: {err}")
+            ok = False
+            break
+        if dump == b"":
+            off += len(part)
+        elif dump == b"\xff":
+            print(f"poke 0x{addr + off:08x}: error (bad address or data?)")
+            ok = False
+            break
+        else:
+            print(f"poke 0x{addr + off:08x}: unexpected reply: {dump.hex(' ')}")
+            ok = False
+            break
+    if ok:
+        print(f"poke 0x{addr:08x}: ok ({len(value)} bytes written)")
         if verify:
-            s.ser.reset_input_buffer()       # the poke read may have stopped on the quiet period with a partial ack left
-            vd, _, _, _, _ = _peek_read(s, len(value), wait)
-            if vd == value:
+            s.ser.reset_input_buffer()
+            vframe = nana_request(1, struct.pack("<II", addr, len(value)))
+            s.ser.write(vframe)
+            s.ser.flush()
+            vd, verr = _nana_read(s, wait)
+            if verr:
+                print(f"  verify: {verr}")
+            elif vd == value:
                 print(f"  verify: peek matches the written data")
             else:
-                print(f"  verify: peek differs (wrote {value.hex(' ')}, read {vd.hex(' ') if vd else 'NO DATA'}"
-                      f"{' - the window is read-only (store dropped)' if not vd else ''})")
-    elif not dump:
-        print(f"poke {cmd}: no beacon (is the stage1 image with the poke blob running?)")
-    else:
-        print(f"poke {cmd}: unexpected frame: {dump.hex(' ')}")
-    junk = bytes(b for b in junk if b != 0x00)      # the 00 invalid-instruction ack is expected after a poke
-    if junk:
-        print(f"  (unparsed tail: {junk.hex(' ')})")
+                print(f"  verify: peek differs (wrote {value.hex(' ')}, read {vd.hex(' ') if vd else 'NO DATA'})")
 
 
 def _parse_poke_data(data):
-    """Validate a hex string (optional 0x prefix, 1-255 bytes) to bytes, or return None."""
+    """Validate a hex string (optional 0x prefix) to bytes, or return None. No size cap:
+    _poke_run chunks the result at NANA_MAX_POKE_DATA."""
     if data[:2].lower() == "0x":
         data = data[2:]
-    if not data or len(data) % 2 or len(data) > 2 * 255:
+    if not data or len(data) % 2:
         return None
     if not all(c in "0123456789abcdefABCDEF" for c in data):
         return None
@@ -639,16 +555,19 @@ def _parse_poke_data(data):
 
 
 def _poke_send(s, addr, value, wait):
-    """Send one poke line and wait for its answer. Returns 'ok' (Z beacon - the write
-    happened, it is not echoed), 'err' (72 FF FF FF error frame), or None (no beacon -
-    the line never reached the blob)."""
+    """Send one poke (binary nana) and wait for its answer.
+    Returns 'ok' (empty payload), 'err' (0xFF payload or CRC/read error), or None (no response)."""
     s.ser.reset_input_buffer()
-    s.send(f"poke 0x{addr:x},{len(value)},{value.hex().upper()}")
-    _, err, beacons, _ = _poke_reply(s, wait)
+    frame = nana_request(2, struct.pack("<I", addr) + value)
+    s.ser.write(frame)
+    s.ser.flush()
+    dump, err = _poke_reply(s, wait)
     if err:
         return "err"
-    if beacons:
+    if dump == b"":
         return "ok"
+    if dump == b"\xff":
+        return "err"
     return None
 
 
@@ -672,21 +591,47 @@ def _poke_chunk(s, addr, value, wait, retries=3, verbose=False):
 
 
 def _poke_file(s, addr, data, wait, verbose=False):
-    """Write a whole file in POKE_MAX-byte chunks (the blob's poke N cap), one
-    confirmed poke per chunk; a progress bar on stdout, and a stop (not a rollback)
-    on the first chunk that never confirms."""
-    nchunks = (len(data) + POKE_MAX - 1) // POKE_MAX
-    print(f"poke file: {len(data)} bytes to 0x{addr:08x} in {nchunks} x {POKE_MAX}-byte chunks")
+    """Write a whole file in NANA_MAX_POKE_DATA-byte chunks (the RX-ring line bound for a
+    poke's [u32 addr][data] args), one confirmed poke per chunk; a progress bar on stdout,
+    and a stop (not a rollback) on the first chunk that never confirms."""
+    nchunks = (len(data) + NANA_MAX_POKE_DATA - 1) // NANA_MAX_POKE_DATA
+    print(f"poke file: {len(data)} bytes to 0x{addr:08x} in {nchunks} x {NANA_MAX_POKE_DATA}-byte chunks")
     t0 = time.time()
     for i in range(nchunks):
-        off = i * POKE_MAX
-        if not _poke_chunk(s, addr + off, data[off:off + POKE_MAX], wait, verbose=verbose):
+        off = i * NANA_MAX_POKE_DATA
+        if not _poke_chunk(s, addr + off, data[off:off + NANA_MAX_POKE_DATA], wait, verbose=verbose):
             print(f"  failed at 0x{addr + off:08x} (chunk {i + 1}/{nchunks}); {off} of {len(data)} bytes written")
             print("  (verify with a peek on a fresh console - a same-console peek right after pokes returns no data)")
             return
-        print(f"\r  {100 * (i + 1) // nchunks:3d}%  {min(off + POKE_MAX, len(data))}/{len(data)} bytes", end="", flush=True)
+        print(f"\r  {100 * (i + 1) // nchunks:3d}%  {min(off + NANA_MAX_POKE_DATA, len(data))}/{len(data)} bytes", end="", flush=True)
     dt = time.time() - t0
     print(f"\npoke file: {len(data)} bytes written in {dt:.2f} s ({len(data) / dt / 1024:.1f} KiB/s)")
+
+
+def _fun_run(s, addr, value, wait, verbose=False, fur=False):
+    """Run one fun (nana cmd 3) or fur (cmd 4) against an already-open console and print
+    the result. ``value`` is the full args bytes ([u32 addr][a0?][a1?]); fun discards the
+    return (an empty payload reply), fur's reply payload is [u32 r0]."""
+    frame = nana_request(4 if fur else 3, value)
+    s.ser.reset_input_buffer()
+    s.ser.write(frame)
+    s.ser.flush()
+    if verbose:
+        print(f"  > nana {'fur' if fur else 'fun'} 0x{addr:08x}")
+    dump, err = _nana_read(s, wait)
+    if err:
+        print(f"{'fur' if fur else 'fun'} 0x{addr:08x}: {err}")
+    elif fur:
+        if len(dump) == 4:
+            print(f"fur 0x{addr:08x}: r0 = 0x{struct.unpack('<I', dump)[0]:08x}")
+        else:
+            print(f"fur 0x{addr:08x}: unexpected reply ({len(dump)} bytes: {dump.hex(' ') if dump else 'empty'})")
+    elif dump == b"":
+        print(f"fun 0x{addr:08x}: ok (return discarded)")
+    elif dump == b"\xff":
+        print(f"fun 0x{addr:08x}: error (bad address or arg count?)")
+    else:
+        print(f"fun 0x{addr:08x}: unexpected reply: {dump.hex(' ')}")
 
 
 def cmd_poke(a):
@@ -704,7 +649,7 @@ def cmd_poke(a):
     else:
         value = _parse_poke_data(a.data)
         if value is None:
-            print("poke: data must be 1-255 bytes of hex (2 digits per byte, no spaces; an optional 0x prefix is fine); refusing")
+            print("poke: data must be even-length hex (2 digits per byte, no spaces; an optional 0x prefix is fine); refusing")
             return
     s = Screen(a.port, a.baud or 115200, a.verbose, a.iac, rfc2217_baud=a.baud or 0)
     if not _open_console(s):
@@ -723,16 +668,16 @@ def cmd_poke(a):
 def cmd_shell(a):
     """One console open, then a peek/poke/raw REPL on the same link.
 
-    The ~3.5-5 s ``comok`` (the panel opening the console on its own schedule)
-    is paid once, at open; every command after that costs only the wire time of
+    The ``comok`` (console open) is paid once, at open; every command after that costs only the wire time of
     its reply (tens to a hundred ms at this link), not another console open.
     Commands: ``peek ADDR [LEN]`` (LEN default 256), ``poke ADDR HEX``,
-    ``raw CMD...``, ``quit``."""
+    ``fun ADDR [ARG0] [ARG1]`` / ``fur ADDR ...`` (nana cmd 3/4; fur prints the
+    returned r0), ``raw CMD...``, ``quit``."""
     s = Screen(a.port, a.baud or 115200, a.verbose, a.iac, rfc2217_baud=a.baud or 0)
     if not _open_console(s):
         print("shell: no comok")
         return 1
-    print("console open. peek ADDR [LEN] | poke ADDR HEX | raw CMD... | quit")
+    print("console open. peek ADDR [LEN] | poke ADDR HEX | fun/fur ADDR [ARG0] [ARG1] | raw CMD... | quit")
     while True:
         try:
             line = input("nanachi> ").strip()
@@ -760,9 +705,17 @@ def cmd_shell(a):
                     addr = int(toks[0], 0)
                     value = _parse_poke_data(toks[1])
                     if value is None:
-                        print("poke: data must be 1-255 bytes of hex (2 digits per byte)")
+                        print("poke: data must be even-length hex (2 digits per byte)")
                     else:
                         _poke_run(s, addr, value, a.wait, False, a.verbose)
+            elif word in ("fun", "fur"):
+                toks = arg.split()
+                if not 1 <= len(toks) <= 3:
+                    print(f"usage: {word} ADDR [ARG0] [ARG1]")
+                else:
+                    addr = int(toks[0], 0)
+                    value = struct.pack("<I", addr) + b"".join(struct.pack("<I", int(t, 0)) for t in toks[1:])
+                    _fun_run(s, addr, value, a.wait, a.verbose, fur=(word == "fur"))
             elif word == "raw":
                 s.ser.reset_input_buffer()
                 s.buf = b""
@@ -783,11 +736,11 @@ def cmd_shell(a):
                 if frames:
                     print([parse_frame(f) for f in frames])
                 else:
-                    # hexdump the undecoded bytes: the 0x5A dispatch beacon and (for a
+                    # hexdump the undecoded bytes: the chi! dispatch beacon and (for a
                     # fur to pk_marker) its 0x00 NUL say whether the target ever ran
                     print(f"no reply (raw bytes: {rawb.hex() if rawb else 'none'})")
             else:
-                print(f"unknown '{word}' (peek ADDR [LEN] | poke ADDR HEX | raw CMD | quit)")
+                print(f"unknown '{word}' (peek ADDR [LEN] | poke ADDR HEX | fun/fur ADDR [ARG0] [ARG1] | raw CMD | quit)")
         except ValueError:
             print("bad number (addr / len)")
         if a.verbose:
@@ -1070,9 +1023,8 @@ def cmd_flash(a):
     s = Screen(a.port, a.start_baud, a.verbose, a.iac)
     # Open the console and put the parser back to idle before anything else: a baud
     # change (or whmi-wri) that lands on a parser mid-command can leave the console
-    # stuck until a power cycle. The patient connect() waits out the panel's own
-    # console-open schedule (~3.5-5 s over the ACM/ser2net path) and resends, unlike
-    # the old 0.6 s-window _connect.
+    # stuck until a power cycle. The patient connect() resends until the comok
+    # arrives, unlike the old 0.6 s-window _connect.
     # A cold boot can take longer than one 6 s connect cap; retry a few times
     # (connect is always-allowed and idempotent).
     comok = False
@@ -1087,10 +1039,9 @@ def cmd_flash(a):
     if a.start_baud != a.flash_baud:
         # Change the rate BEFORE the upload command (docs/commands.md): bytes sent right
         # after a host-side rate change are unreliable, a truncated first chunk is
-        # silently dropped. After the switch the console may re-init and reopens on
-        # its own schedule, so wait for the comok patiently instead of assuming; on
-        # failure the fix is a power cycle (no automatic revert - it re-inits again
-        # and can wedge the parser).
+        # silently dropped. After the switch the console may re-init, so wait for
+        # the comok patiently instead of assuming; on failure the fix is a power
+        # cycle (no automatic revert - it re-inits again and can wedge the parser).
         s.send(f"baud={a.flash_baud}")
         time.sleep(0.2)
         s.ser.baudrate = a.flash_baud
@@ -1145,14 +1096,14 @@ def main():
 
     k = sub.add_parser("peek", help="read panel memory as a hex dump; -w FILE saves the binary dump (needs the stage1 image's peek blob running)")
     k.add_argument("addr", type=lambda s: int(s, 0), help="start address (0x hex or decimal)")
-    k.add_argument("length", type=lambda s: int(s, 0), help="bytes to dump (must be < 0x4000 and inside one readable window)")
+    k.add_argument("length", type=lambda s: int(s, 0), help="bytes to dump (no blob cap; the reply goes out the raw TX)")
     k.add_argument("-w", "--write", metavar="FILE", help="write the binary dump to FILE (raw bytes, no hex formatting)")
     k.add_argument("--wait", type=float, default=3.0, help="max seconds to wait for the dump (a 0.6 s quiet period ends it early)")
     k.set_defaults(fn=cmd_peek)
 
-    pk = sub.add_parser("poke", help="write panel memory (needs the stage1 image's poke blob running): 1-255 bytes of hex, or a whole file as @file in 255-byte chunks; a success answers no frame, --verify re-reads with peek (hex only)")
+    pk = sub.add_parser("poke", help="write panel memory (needs the stage1 image's poke blob running): hex, or a whole file as @file (chunked at 4045 bytes per request); a success answers the empty-payload frame, --verify re-reads with peek (hex only)")
     pk.add_argument("addr", type=lambda s: int(s, 0), help="start address (0x hex or decimal), inside one readable window (no alignment needed)")
-    pk.add_argument("data", help="the bytes to write as hex, 1-255 bytes (2 digits per byte; an optional 0x prefix is fine), or @<filename> to write the whole file (255-byte chunks, each confirmed by the Z beacon)")
+    pk.add_argument("data", help="the bytes to write as hex (2 digits per byte; an optional 0x prefix is fine), or @<filename> to write the whole file (4045-byte chunks, each confirmed by the reply)")
     pk.add_argument("--verify", action="store_true", help="after a successful poke, peek the range back and compare (hex mode only)")
     pk.add_argument("--wait", type=float, default=3.0, help="max seconds to wait for the readback (a 0.6 s quiet period ends it early)")
     pk.set_defaults(fn=cmd_poke)
@@ -1163,7 +1114,7 @@ def main():
     sh.add_argument("--wait", type=float, default=10.0, help="max seconds to wait for the full dump (a 0.6 s quiet period ends it early)")
     sh.set_defaults(fn=cmd_shot)
 
-    sh = sub.add_parser("shell", help="one console open, then a peek/poke/raw REPL on the same link (the 3.5-5 s comok is paid once)")
+    sh = sub.add_parser("shell", help="one console open, then a peek/poke/raw REPL on the same link")
     sh.add_argument("--wait", type=float, default=3.0, help="max seconds per command (a 0.6 s quiet period ends it early)")
     sh.set_defaults(fn=cmd_shell)
 

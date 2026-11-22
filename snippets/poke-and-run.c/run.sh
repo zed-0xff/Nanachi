@@ -1,8 +1,8 @@
 #!/bin/sh
 # poke-and-run (C): poke the 300-byte buzz blob (compiled from buzz_blob.c) into
-# panel SDRAM 0x650000 and blx it (fun0 0x650001). Success = byte-identical
-# readback + the 0x5A fun ack. Everything talks to the panel only via
-# tools/screen_probe.py.
+# panel SDRAM 0x650000 and blx it (the nana `fun` command: fun 0x650001 - the
+# Thumb bit set). Success = byte-identical readback + the "fun 0x00650001: ok"
+# reply. Everything talks to the panel only via tools/screen_probe.py.
 #
 # Env: see common.sh (PANEL_PORT required).
 #
@@ -25,7 +25,7 @@ check_live "$TMP/live_before.bin" || exit 1
 echo "[2/6] pre-poke: 8 bytes at 0x650000 (stdout dump)"
 probe peek 0x650000 8
 
-echo "[3/6] poke 300 bytes to 0x650000 (@file, 255-byte chunks)"
+echo "[3/6] poke 300 bytes to 0x650000 (@file; under the 4045-byte poke cap - one nana request)"
 probe poke 0x650000 "@$BLOB"
 
 echo "[4/6] verify: fresh-console 300-byte readback, cmp with the blob"
@@ -43,12 +43,12 @@ while [ $i -le 2 ]; do
 done
 [ $i -le 2 ] || { echo "run.sh: poke did not stick after 2 attempts" >&2; exit 1; }
 
-echo "[5/6] blx the blob: fun0 0x650001 (expect a 0x5A ack)"
-ack=$(printf 'raw fun0 0x650001\nquit\n' | probe shell --wait 3.0)
-if printf '%s\n' "$ack" | grep -q 'raw bytes: 5a'; then
-    echo "run.sh: fun0 ack received: 0x5A"
+echo "[5/6] blx the blob: fun 0x650001 (expect the 'fun 0x00650001: ok' reply)"
+ack=$(printf 'fun 0x650001\nquit\n' | probe shell --wait 10)
+if printf '%s\n' "$ack" | grep -q 'fun 0x00650001: ok'; then
+    echo "run.sh: fun ok received (the blob ran and returned)"
 else
-    echo "run.sh: no 0x5A ack; shell output was:"
+    echo "run.sh: no 'fun ... ok' reply; shell output was:"
     printf '%s\n' "$ack"
     exit 1
 fi
@@ -60,6 +60,6 @@ check_live "$TMP/live_after.bin" || {
     exit 1
 }
 
-echo "run.sh: OK - poked, blx'd (0x5A ack), panel still live."
+echo "run.sh: OK - poked, blx'd (fun ok), panel still live."
 echo "run.sh: (is the 'ta-daa' audible? if not, run verify.sh for the register fingerprint)"
 exit 0

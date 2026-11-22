@@ -29,8 +29,29 @@ pinmux, own boot flow), not for this screen, and it has not been built or booted
 longer need to be written from scratch for tier 1a below — they need adapting.
 
 One open question this resolves only partially: which exact variant this screen uses. The BSP supports two,
-`GM6721` and `F6721B` (register layout differs in a handful of places — see the HAL's `#ifdef CHIP_F6721B`).
-The vendor's own `bpi_eai80_qfn80pin` dev board builds with `CONFIG_SOC_F6721B` — a first concrete lean
+selected by Kconfig `SOC_GM6721`/`SOC_F6721B` → HAL `CHIP_GM6721`/`CHIP_F6721B`. They share the same
+dual-Cortex-M4 core and most peripherals; the differences are a handful of register/pinmux details
+(all gated by `#ifdef CHIP_F6721B` in `ulibs/hal/gree`):
+
+| area | GM6721 | F6721B |
+|---|---|---|
+| timers (`gm_hal_tim.c` IRQ table) | TIM1–5 + TIM8–14 (12) | TIM1–5 + TIM8 only (6) — no TIM9–14 |
+| RTC / power wakeup pins | XPA7 / XPA8 | XPB12 / XPB13 |
+| backup-domain soft-reset bit (`soc_gm6721x.h`) | bit 8 | bit 31 |
+| oscillator IOMODE regs (`soc_gm6721x.h`) | HOSC/LOSC in IOMODE0/1 | HOSC in IOMODE2, LOSC in IOMODE1 (different bit masks) |
+| SDRAM pinmux (`gm_hal_sdram.c`) | one GPIO assignment block | a different one |
+| sys-clock source enum (`gm_hal_clock.h`) | — | adds `PLLSAI` (0x05) |
+| camera I2C SDA pin (`gm6721x_driver_feature.h`) | 1 | 3 |
+
+**How to determine which one *this* PCB is — the decisive test.** Every TIM has a read-only hardwired
+`VER` register at `base+0xFC` (SVD `TIM3_VER`/`TIM9_VER` = `0x03010100`); a present timer returns it, an
+absent slot reads `0`. Probe over the nana console (cmd 1, `peek [u32 addr][u32 size]`):
+- `peek 0x400070FC 4` = TIM1.VER (present on both) → expect `0x03010100`;
+- `peek 0x400076FC 4` = TIM9.VER → `0x03010100` = **GM6721**, `0x00000000` = **F6721B**.
+Optionally sweep `0x400070FC … 0x40007BFC` (0x100 step) to map the whole present set. No decode table needed.
+Secondary (not yet conclusive): decode the CID register @ `0x40000000` (this unit reads `0x6721FC11`; low
+bytes presumably encode the variant — vendor decode TBD), or read the stock firmware's variant-specific refs
+in the IDA DB. The vendor's own `bpi_eai80_qfn80pin` dev board builds with `CONFIG_SOC_F6721B` — a lean
 toward F6721B for this chip family, not proof for this specific screen PCB.
 
 ### Boot chain (and what we control of it)
@@ -176,8 +197,8 @@ computer (shell + files + games) and the HMI becomes just one of its apps.
 ## Open questions
 
 - ~~The SoC part name~~ — resolved: Gree Edgeless GM6721-family (EAI80), vendor BSP at
-  `ext/SoC/BPI-EAI80-bsp`. Still open: GM6721 vs F6721B for *this* board specifically (see the platform
-  section).
+  `ext/SoC/BPI-EAI80-bsp`. Still open: GM6721 vs F6721B for *this* board — settle it with the TIM9.VER
+  probe in the platform section (`peek 0x400076FC 4`); vendor dev board leans F6721B.
 - The descriptor's `0x100` / `0x60000` fields (XIP window parameters?) — needs the ROM or a logic-analyzer
   boot capture (captures are in `4.txt` / `8.txt`).
 - The size / enable registers of the `0x20000000` RAM bank.

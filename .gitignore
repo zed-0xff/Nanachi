@@ -9,9 +9,7 @@
 *.rgb565
 
 __pycache__/
-.env
-.operator*
-.DS_Store
+.*
 kitchen/
 tmp*
 skills

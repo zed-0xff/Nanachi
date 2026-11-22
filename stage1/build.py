@@ -85,7 +85,7 @@ CCFLAGS = [
     "-mcpu=cortex-m4", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv4-sp-d16",
     "-O2", "-ffunction-sections", "-fdata-sections",
     "-nostdlib", "-nostartfiles", "-nodefaultlibs",
-    "-Wall", "-Wextra", "-I.",
+    "-Wall", "-Wextra", "-I" + HERE,
     "-DSKIP_MITMY_POLL",
 ]
 

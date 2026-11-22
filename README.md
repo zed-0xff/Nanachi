@@ -3,7 +3,7 @@
 ![Nanachi](Nanachi.png)
 
 A framework for TJC / Nextion-family touch-and-display panels (the AiHmiT7 line, e.g. the
-SoVol SV08MAX `TJC4827X243` 800×480). Two independent things ship here:
+SoVol SV08MAX `TJC4827X243` 480×272). Two independent things ship here:
 
 1. **Stage 0 bootloader** — `stage1/`. A drop-in replacement for the panel's firmware that boots
    from an SD card, validates the image, and can hand off to stock firmware. See `stage1/README.md`.
@@ -70,7 +70,8 @@ container-format images the stage 0 loader reads from a FAT SD card. Regenerate 
 Detailed notes on the firmware, protocol and hardware:
 
 - [`docs/flash_layout.md`](docs/flash_layout.md) — 16 MiB SPI flash layout, the container/XOR/CRC scheme, how the pieces were dumped and cut out.
-- [`docs/commands.md`](docs/commands.md) — every serial command and system variable this firmware knows, tagged with confidence.
+- [`docs/commands.md`](docs/commands.md) — every serial command and system variable this firmware knows, tagged with confidence; also cross-referenced against the official vendor manual.
+- [`docs/tjc_official.md`](docs/tjc_official.md) — English translation of the official TJC/Nextion serial-HMI manual (the generic product-line reference the screen belongs to).
 - [`docs/porting.md`](docs/porting.md) — porting guide (FatFs, SD on SPI, UART buffer).
 - [`docs/test-bench.md`](docs/test-bench.md) — unattended hardware loop (USB relay, camera, ESP32 bridge), serial traps, dead ends.
 - [`docs/widget_map.md`](docs/widget_map.md) — page-to-widget map joined from the stock `.tft` and the client source (`docs/widget_map.py`).
