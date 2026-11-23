@@ -108,7 +108,7 @@ def nana_request(cmd: int, args: bytes) -> bytes:
     return b"nana " + struct.pack("<I", size) + payload + struct.pack("<I", crc) + b" " + END
 
 
-def _nana_read(s, wait=2.0):
+def _nana_read(s, wait=2.0, quiet=0.6):
     """Read one nana binary reply from the screen.
     Expected stream: "chi!" [u32 size LE][payload][u32 crc32 LE] (then optionally 0x00 FF FF FF).
     Returns (payload_bytes, error_string_or_None)."""
@@ -121,20 +121,35 @@ def _nana_read(s, wait=2.0):
         if c:
             raw += c
             last = time.time()
-            # Try to parse the reply
+            # Try to parse the reply. The beacon is also "chi!", so scan
+            # every occurrence and return the first anchor whose stored CRC
+            # validates; a bad CRC on a length-complete frame is reported for
+            # the last such candidate (existing behavior).
             m = raw.find(b"chi!")
-            body = raw[m + 4:] if m >= 0 else raw
-            if len(body) >= 4:
+            anchors = [-4] if m < 0 else []
+            while m >= 0:
+                anchors.append(m)
+                m = raw.find(b"chi!", m + 4)
+            last_bad = None
+            for a in anchors:
+                body = raw[a + 4:]
+                if len(body) < 4:
+                    continue
                 size = struct.unpack("<I", body[:4])[0]
                 total = 4 + size + 4  # size field + payload + crc
-                if len(body) >= total:
-                    payload = body[4:4 + size]
-                    crc_stored = struct.unpack("<I", body[4 + size:8 + size])[0]
-                    crc_calc = nana_crc32(payload)
-                    if crc_stored != crc_calc:
-                        return payload, f"CRC mismatch: stored 0x{crc_stored:08x} calc 0x{crc_calc:08x}"
-                    return payload, None
-        elif raw and time.time() - last > 0.6:
+                if len(body) < total:
+                    continue
+                payload = body[4:4 + size]
+                crc_stored = struct.unpack("<I", body[4 + size:8 + size])[0]
+                crc_calc = nana_crc32(payload)
+                if crc_stored != crc_calc:
+                    last_bad = (payload, crc_stored, crc_calc)
+                    continue
+                return payload, None
+            if last_bad is not None:
+                payload, crc_stored, crc_calc = last_bad
+                return payload, f"CRC mismatch: stored 0x{crc_stored:08x} calc 0x{crc_calc:08x}"
+        elif raw and time.time() - last > quiet:
             break
     if not raw:
         return b"", "no response"
@@ -618,7 +633,7 @@ def _fun_run(s, addr, value, wait, verbose=False, fur=False):
     s.ser.flush()
     if verbose:
         print(f"  > nana {'fur' if fur else 'fun'} 0x{addr:08x}")
-    dump, err = _nana_read(s, wait)
+    dump, err = _nana_read(s, wait, quiet=wait)
     if err:
         print(f"{'fur' if fur else 'fun'} 0x{addr:08x}: {err}")
     elif fur:

@@ -10,10 +10,13 @@ if [ -z "${PANEL_PORT:-}" ]; then
     exit 2
 fi
 
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# HERE/BLOB may be pre-set by the per-folder shims (snippets/poke-and-run.{asm,c}/
+# run.sh, verify.sh) so BLOB points at the PER-FOLDER buzz_blob.bin, not this
+# directory. Default: the directory of the script that sourced us.
+HERE=${HERE:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
 ROOT=$(CDPATH= cd -- "$HERE/../.." && pwd)
 PROBE="$ROOT/tools/screen_probe.py"
-BLOB="$HERE/buzz_blob.bin"
+BLOB=${BLOB:-$HERE/buzz_blob.bin}
 
 # The console blob head at the PEEK_BLOB_DST gap (0x79D448): present when the
 # stage-0 image with the 0x2A1E console blob is running.
